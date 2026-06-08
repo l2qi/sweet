@@ -1,0 +1,40 @@
+[package]
+name = "sweet-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Agent loop, hooks, subagents, and handoffs for the sweet AI agent framework."
+
+[features]
+test-util = []
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+sweet-core = { path = "../sweet-core" }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tracing-subscriber = { workspace = true }
+
+[[test]]
+name = "handoff"
+required-features = ["test-util"]
+
+[[test]]
+name = "subagent"
+required-features = ["test-util"]
+
+[[test]]
+name = "parallel"
+required-features = ["test-util"]
+
+[[test]]
+name = "permission"
+required-features = ["test-util"]
