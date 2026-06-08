@@ -1,0 +1,31 @@
+[package]
+name = "sweet-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "LLM provider implementations for the sweet AI agent framework."
+
+[features]
+default = ["openai", "gemini", "anthropic"]
+openai = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
+gemini = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
+anthropic = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+sweet-agent = { path = "../sweet-agent", features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }
+serial_test = { workspace = true }
+tracing-subscriber = { workspace = true }

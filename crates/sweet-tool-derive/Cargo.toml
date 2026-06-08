@@ -1,0 +1,15 @@
+[package]
+name = "sweet-tool-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Proc-macro derive for sweet ToolSpec handlers."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

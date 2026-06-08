@@ -1,0 +1,29 @@
+[package]
+name = "sweet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Core traits and types for the sweet AI agent framework."
+
+[features]
+derive = ["dep:sweet-tool-derive", "dep:schemars"]
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "fs", "process"] }
+tracing = { workspace = true }
+schemars = { workspace = true, optional = true }
+sweet-tool-derive = { path = "../sweet-tool-derive", optional = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

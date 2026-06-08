@@ -1,0 +1,17 @@
+[package]
+name = "sweet-mcp-mock-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Mock MCP server used by sweet-mcp's hermetic integration tests."
+
+[dependencies]
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "net"] }
+serde_json = { workspace = true }
+axum = { workspace = true }
