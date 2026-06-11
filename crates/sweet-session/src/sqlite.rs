@@ -8,16 +8,39 @@ use sweet_core::{MemoryItem, Message, Session, SessionError, SessionId};
 
 /// SQLite-backed session.
 ///
-/// Maintains an in-memory cache alongside the database for fast reads.
-/// By default opens an in-memory transient store (`:memory:`); pass a file
-/// path to `open()` for persistence.
+/// Maintains an in-memory cache of the *live* transcript alongside the
+/// database for fast reads. By default opens an in-memory transient store
+/// (`:memory:`); pass a file path to `open()` for persistence.
 ///
 /// Each database file stores a single session. Opening an existing file loads
-/// the most recent session's items.
+/// the most recent session's live items.
+///
+/// # Archived rows
+///
+/// [`replace_range`](Session::replace_range) (compaction) does not delete the
+/// rows it replaces — it marks them `archived`. Archived rows are invisible
+/// to the [`Session`] trait (`items`, `messages`, `token_count`,
+/// `total_tokens`) but are retained on disk and readable via
+/// [`full_messages`](Self::full_messages) / [`full_items`](Self::full_items),
+/// so a UI can show the complete history of a heavily compacted session
+/// without a second store. [`clear`](Session::clear) is a full teardown and
+/// deletes archived rows too.
+///
+/// Ordering uses a `position REAL` column instead of rowid: replacements are
+/// inserted at fractional positions bisected into the gap after the span they
+/// replace, which keeps both the live order and the full-transcript order
+/// stable across reopen without rewriting rows. Each compaction bisects a
+/// given gap at most once per replacement item, so position precision is
+/// nowhere near f64 limits in practice.
 pub struct SqliteSession {
     id: SessionId,
     conn: Mutex<Connection>,
     cache: Vec<MemoryItem>,
+    /// Live rows' positions, parallel to `cache`.
+    positions: Vec<f64>,
+    /// Highest position ever used in this session (including archived rows),
+    /// so appends never collide with an archived tail.
+    max_position: f64,
 }
 
 impl SqliteSession {
@@ -74,19 +97,21 @@ impl SqliteSession {
         tx.commit()?;
 
         let mut cache = Vec::new();
+        let mut positions = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT kind, data, tokens FROM items WHERE session_id = ?1 ORDER BY rowid",
+                "SELECT kind, data, position FROM items
+                 WHERE session_id = ?1 AND archived = 0 ORDER BY position",
             )?;
             let rows = stmt.query_map(params![id.to_string()], |row| {
                 let kind: String = row.get(0)?;
                 let data: String = row.get(1)?;
-                let _tokens: Option<i64> = row.get(2)?;
-                Ok((kind, data))
+                let position: f64 = row.get(2)?;
+                Ok((kind, data, position))
             })?;
 
             for row in rows {
-                let (kind, data) = row?;
+                let (kind, data, position) = row?;
                 if kind == "message" {
                     let msg: Message = serde_json::from_str(&data).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
@@ -96,14 +121,23 @@ impl SqliteSession {
                         )
                     })?;
                     cache.push(MemoryItem::Message(msg));
+                    positions.push(position);
                 }
             }
         }
+
+        let max_position: f64 = conn.query_row(
+            "SELECT COALESCE(MAX(position), 0) FROM items WHERE session_id = ?1",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
 
         Ok(Self {
             id,
             conn: Mutex::new(conn),
             cache,
+            positions,
+            max_position,
         })
     }
 
@@ -122,11 +156,59 @@ impl SqliteSession {
                 kind       TEXT NOT NULL,
                 data       TEXT NOT NULL,
                 tokens     INTEGER,
-                metadata   TEXT
+                metadata   TEXT,
+                archived   INTEGER NOT NULL DEFAULT 0,
+                position   REAL NOT NULL
             )",
             [],
         )?;
         Ok(())
+    }
+
+    /// The full transcript: every item, archived and live, in transcript
+    /// order. Archived originals appear in place; compaction summaries (live,
+    /// `compacted: true`) appear immediately after the span they replaced.
+    pub fn full_messages(&self) -> sweet_core::error::Result<Vec<Message>> {
+        Ok(self
+            .full_items()?
+            .into_iter()
+            .map(|(item, _)| match item {
+                MemoryItem::Message(msg) => msg,
+            })
+            .collect())
+    }
+
+    /// Like [`full_messages`](Self::full_messages), but yields each item with
+    /// its archived flag, for UIs that want to style replaced history.
+    pub fn full_items(&self) -> sweet_core::error::Result<Vec<(MemoryItem, bool)>> {
+        let conn = self
+            .conn
+            .lock()
+            .expect("sqlite connection mutex not poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, data, archived FROM items
+                 WHERE session_id = ?1 ORDER BY position",
+            )
+            .map_err(SessionError::storage)?;
+        let rows = stmt
+            .query_map(params![self.id.to_string()], |row| {
+                let kind: String = row.get(0)?;
+                let data: String = row.get(1)?;
+                let archived: bool = row.get(2)?;
+                Ok((kind, data, archived))
+            })
+            .map_err(SessionError::storage)?;
+
+        let mut items = Vec::new();
+        for row in rows {
+            let (kind, data, archived) = row.map_err(SessionError::storage)?;
+            if kind == "message" {
+                let msg: Message = serde_json::from_str(&data).map_err(SessionError::storage)?;
+                items.push((MemoryItem::Message(msg), archived));
+            }
+        }
+        Ok(items)
     }
 }
 
@@ -136,6 +218,7 @@ impl Session for SqliteSession {
     }
 
     fn push(&mut self, item: MemoryItem) -> sweet_core::error::Result<()> {
+        let position = self.max_position + 1.0;
         {
             let conn = self
                 .conn
@@ -145,14 +228,22 @@ impl Session for SqliteSession {
                 MemoryItem::Message(msg) => {
                     let data = serde_json::to_string(msg).map_err(SessionError::storage)?;
                     conn.execute(
-                        "INSERT INTO items (session_id, kind, data, tokens) VALUES (?1, 'message', ?2, ?3)",
-                        params![self.id.to_string(), data, msg.token_count.map(|t| t as i64)],
+                        "INSERT INTO items (session_id, kind, data, tokens, position)
+                         VALUES (?1, 'message', ?2, ?3, ?4)",
+                        params![
+                            self.id.to_string(),
+                            data,
+                            msg.token_count.map(|t| t as i64),
+                            position
+                        ],
                     )
                     .map_err(SessionError::storage)?;
                 }
             }
         }
         self.cache.push(item);
+        self.positions.push(position);
+        self.max_position = position;
         Ok(())
     }
 
@@ -175,6 +266,7 @@ impl Session for SqliteSession {
                 .conn
                 .lock()
                 .expect("sqlite connection mutex not poisoned");
+            // Full teardown: archived history goes too.
             conn.execute(
                 "DELETE FROM items WHERE session_id = ?1",
                 params![self.id.to_string()],
@@ -182,6 +274,8 @@ impl Session for SqliteSession {
             .map_err(SessionError::storage)?;
         }
         self.cache.clear();
+        self.positions.clear();
+        self.max_position = 0.0;
         Ok(())
     }
 
@@ -202,7 +296,8 @@ impl Session for SqliteSession {
                 .expect("sqlite connection mutex not poisoned");
             let total: i64 = conn
                 .query_row(
-                    "SELECT COALESCE(SUM(tokens), 0) FROM items WHERE session_id = ?1",
+                    "SELECT COALESCE(SUM(tokens), 0) FROM items
+                     WHERE session_id = ?1 AND archived = 0",
                     params![self.id.to_string()],
                     |row| row.get(0),
                 )
@@ -220,38 +315,58 @@ impl Session for SqliteSession {
         range: std::ops::Range<usize>,
         replacement: Vec<MemoryItem>,
     ) -> sweet_core::error::Result<()> {
-        // SQLite assigns rowids monotonically via AUTOINCREMENT, and we use
-        // rowid order on read to reconstruct the cache. A naïve "delete the
-        // affected rows and append replacements" leaves the new rows at the
-        // tail, so on reopen the order would no longer match the in-memory
-        // cache. Instead, build the new cache up front and wipe-and-rebuild
-        // the session's rows so disk order matches cache order exactly.
-        let mut new_cache: Vec<MemoryItem> =
-            Vec::with_capacity(self.cache.len() + replacement.len() - (range.end - range.start));
-        new_cache.extend_from_slice(&self.cache[..range.start]);
-        new_cache.extend(replacement);
-        new_cache.extend_from_slice(&self.cache[range.end..]);
+        // Archive the replaced rows in place and insert the replacements at
+        // fractional positions bisected into the gap between the end of the
+        // replaced span and the next live row. The originals keep their
+        // positions, so the full transcript stays ordered with the summary
+        // directly after the span it replaced.
+        let lower = if range.end > range.start {
+            self.positions[range.end - 1]
+        } else if range.start > 0 {
+            self.positions[range.start - 1]
+        } else {
+            0.0
+        };
+        let upper = self.positions.get(range.end).copied();
 
-        let mut conn = self
-            .conn
-            .lock()
-            .expect("sqlite connection mutex not poisoned");
-        let tx = conn.transaction().map_err(SessionError::storage)?;
+        let new_positions: Vec<f64> = match upper {
+            Some(upper) => {
+                let step = (upper - lower) / (replacement.len() as f64 + 1.0);
+                (1..=replacement.len())
+                    .map(|k| lower + step * k as f64)
+                    .collect()
+            }
+            // No live successor: extend the tail in whole steps.
+            None => (1..=replacement.len()).map(|k| lower + k as f64).collect(),
+        };
 
-        tx.execute(
-            "DELETE FROM items WHERE session_id = ?1",
-            params![self.id.to_string()],
-        )
-        .map_err(SessionError::storage)?;
+        {
+            let mut conn = self
+                .conn
+                .lock()
+                .expect("sqlite connection mutex not poisoned");
+            let tx = conn.transaction().map_err(SessionError::storage)?;
 
-        for item in &new_cache {
-            insert_item(&tx, &self.id, item)?;
+            for position in &self.positions[range.clone()] {
+                tx.execute(
+                    "UPDATE items SET archived = 1
+                     WHERE session_id = ?1 AND archived = 0 AND position = ?2",
+                    params![self.id.to_string(), position],
+                )
+                .map_err(SessionError::storage)?;
+            }
+            for (item, position) in replacement.iter().zip(&new_positions) {
+                insert_item(&tx, &self.id, item, *position)?;
+            }
+
+            tx.commit().map_err(SessionError::storage)?;
         }
 
-        tx.commit().map_err(SessionError::storage)?;
-        drop(conn);
-
-        self.cache = new_cache;
+        self.cache.splice(range.clone(), replacement);
+        self.positions.splice(range, new_positions.iter().copied());
+        self.max_position = self
+            .max_position
+            .max(new_positions.last().copied().unwrap_or(0.0));
         Ok(())
     }
 
@@ -264,16 +379,19 @@ fn insert_item(
     tx: &rusqlite::Transaction<'_>,
     session_id: &SessionId,
     item: &MemoryItem,
+    position: f64,
 ) -> sweet_core::error::Result<()> {
     match item {
         MemoryItem::Message(msg) => {
             let data = serde_json::to_string(msg).map_err(SessionError::storage)?;
             tx.execute(
-                "INSERT INTO items (session_id, kind, data, tokens) VALUES (?1, 'message', ?2, ?3)",
+                "INSERT INTO items (session_id, kind, data, tokens, position)
+                 VALUES (?1, 'message', ?2, ?3, ?4)",
                 params![
                     session_id.to_string(),
                     data,
-                    msg.token_count.map(|t| t as i64)
+                    msg.token_count.map(|t| t as i64),
+                    position
                 ],
             )
             .map_err(SessionError::storage)?;

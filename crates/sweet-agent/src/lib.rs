@@ -16,6 +16,7 @@ pub mod dynamic_prompt;
 pub mod extension;
 pub mod handoff;
 pub mod hooks;
+pub mod memory;
 pub mod runloop;
 pub mod subagent;
 
@@ -34,6 +35,10 @@ pub use extension::{
 pub use handoff::{HandoffContext, HandoffHandler, HandoffResult, HandoffSpec, TurnResult};
 pub use hooks::{
     HookCapability, HookDispatcher, HookEvent, HookInvocation, ProcedureHandler, ProcedureSpec,
+};
+pub use memory::{
+    memory_distill_capabilities, memory_distiller_capabilities, memory_recall_capabilities,
+    DistillConfig, MemoryDistiller, MemoryRecall, DISTILL_PROCEDURE_ID, RECALL_PROCEDURE_ID,
 };
 pub use runloop::{run, AgentIo, RunOutcome};
 pub use subagent::{SubagentContext, SubagentHandler, SubagentSpec, DEFAULT_MAX_DEPTH};

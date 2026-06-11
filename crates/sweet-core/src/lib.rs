@@ -8,7 +8,9 @@
 //! that all other sweet crates build on. Agent behavior lives in `sweet-agent`;
 //! LLM provider implementations live in `sweet-llm`.
 
+pub mod embedder;
 pub mod error;
+pub mod memory;
 pub mod message;
 pub mod model;
 pub mod permission;
@@ -18,7 +20,12 @@ pub mod stream;
 pub mod tool;
 pub mod version;
 
+pub use embedder::Embedder;
 pub use error::{Error, Result};
+pub use memory::{
+    cosine_similarity, rrf_merge, unix_now, EphemeralMemory, Memory, MemoryError, MemoryHit,
+    MemoryId, MemoryQuery, MemoryRecord, MemoryScope, DEFAULT_QUERY_LIMIT,
+};
 pub use message::{ContentBlock, Message, Role, ThinkingContent, ToolCall};
 pub use model::Model;
 pub use permission::{

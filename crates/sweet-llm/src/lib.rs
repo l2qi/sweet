@@ -25,9 +25,9 @@ pub mod openai;
 #[cfg(feature = "anthropic")]
 pub use anthropic::AnthropicProvider;
 #[cfg(feature = "gemini")]
-pub use gemini::GeminiProvider;
+pub use gemini::{GeminiEmbedder, GeminiProvider};
 #[cfg(feature = "openai")]
-pub use openai::OpenAIProvider;
+pub use openai::{OpenAIEmbedder, OpenAIProvider};
 
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 mod error;

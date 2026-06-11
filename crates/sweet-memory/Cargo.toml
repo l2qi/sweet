@@ -1,0 +1,23 @@
+[package]
+name = "sweet-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Long-term memory implementations for the sweet AI agent framework."
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile = { workspace = true }

@@ -13,6 +13,9 @@ use crate::error::ProviderError;
 use crate::schema::sanitize_schema;
 use crate::util::{elapsed_ms, json_string, provider_error_from_core};
 
+mod embeddings;
+pub use embeddings::{OpenAIEmbedder, DEFAULT_EMBEDDING_MODEL};
+
 mod reasoning;
 pub use reasoning::ReasoningContent;
 
