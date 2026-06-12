@@ -5,8 +5,10 @@
 
 use std::time::Duration;
 
-use rusqlite::Connection;
-use sweet_core::{MemoryError, MemoryQuery, MemoryRecord, MemoryScope};
+use rusqlite::{params_from_iter, Connection};
+use sweet_core::{
+    rrf_merge, Embedder, MemoryError, MemoryHit, MemoryQuery, MemoryRecord, MemoryScope,
+};
 
 /// How many candidates each ranking strategy contributes before fusion.
 pub(crate) const CANDIDATE_LIMIT: usize = 50;
@@ -98,12 +100,108 @@ pub(crate) fn collect_records(
     Ok(records)
 }
 
+/// Rust-side scope + tag filter for one candidate record. Query paths that
+/// already filter scope in SQL pass through unchanged; the sqlite-vec KNN
+/// path relies on this for scope enforcement (its scan can't carry extra
+/// WHERE clauses).
 pub(crate) fn filter_record(record: MemoryRecord, query: &MemoryQuery) -> Option<MemoryRecord> {
-    query
-        .tags
-        .iter()
-        .all(|t| record.tags.contains(t))
-        .then_some(record)
+    let scope_ok = query.scopes.is_empty() || query.scopes.contains(&record.scope);
+    let tags_ok = query.tags.iter().all(|t| record.tags.contains(t));
+    (scope_ok && tags_ok).then_some(record)
+}
+
+/// Embed the query text, tagging the vector with the embedder's id.
+/// `Ok(None)` when there is no embedder or it returns no vector (the search
+/// degrades to keyword-only); an embedding *error* fails the search.
+pub(crate) async fn embed_query(
+    embedder: Option<&dyn Embedder>,
+    text: &str,
+) -> Result<Option<(Vec<f32>, String)>, MemoryError> {
+    let Some(embedder) = embedder else {
+        return Ok(None);
+    };
+    Ok(embedder
+        .embed(&[text.to_string()])
+        .await
+        .map_err(|e| MemoryError::Embedding(e.into()))?
+        .pop()
+        .map(|v| (v, embedder.id().to_string())))
+}
+
+/// List mode (a query without text): newest first within the filters, with a
+/// zero relevance score.
+pub(crate) fn list_newest(
+    conn: &Connection,
+    query: &MemoryQuery,
+) -> Result<Vec<MemoryHit>, MemoryError> {
+    let (scope_clause, scope_params) = scope_filter(&query.scopes);
+    let sql = format!(
+        "SELECT {RECORD_COLUMNS} FROM memories WHERE 1=1{scope_clause}
+         ORDER BY updated_at DESC, id DESC"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(MemoryError::storage)?;
+    let rows = stmt
+        .query_map(params_from_iter(scope_params), row_to_record)
+        .map_err(MemoryError::storage)?;
+    Ok(collect_records(rows, query)?
+        .into_iter()
+        .take(query.limit)
+        .map(|record| MemoryHit { record, score: 0.0 })
+        .collect())
+}
+
+/// Keyword candidates from the FTS5 index, best (lowest bm25) first.
+pub(crate) fn fts_candidates(
+    conn: &Connection,
+    text: &str,
+    query: &MemoryQuery,
+) -> Result<Vec<MemoryRecord>, MemoryError> {
+    let match_expr = fts_match_expr(text);
+    if match_expr.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (scope_clause, scope_params) = scope_filter(&query.scopes);
+    let sql = format!(
+        "SELECT {RECORD_COLUMNS_QUALIFIED} FROM memories_fts
+         JOIN memories ON memories.rowid = memories_fts.rowid
+         WHERE memories_fts MATCH ?1{scope_clause}
+         ORDER BY bm25(memories_fts) LIMIT {CANDIDATE_LIMIT}"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(MemoryError::storage)?;
+    let params_iter = std::iter::once(match_expr).chain(scope_params);
+    let rows = stmt
+        .query_map(params_from_iter(params_iter), row_to_record)
+        .map_err(MemoryError::storage)?;
+    collect_records(rows, query)
+}
+
+/// Fuse the keyword and semantic rankings with Reciprocal Rank Fusion and
+/// return the top `limit` hits.
+pub(crate) fn fuse_hits(
+    keyword: Vec<MemoryRecord>,
+    vector: Vec<MemoryRecord>,
+    limit: usize,
+) -> Vec<MemoryHit> {
+    let mut by_id: Vec<MemoryRecord> = Vec::new();
+    for record in keyword.iter().chain(vector.iter()) {
+        if !by_id.iter().any(|r| r.id == record.id) {
+            by_id.push(record.clone());
+        }
+    }
+    let rankings = [
+        keyword.into_iter().map(|r| r.id).collect::<Vec<_>>(),
+        vector.into_iter().map(|r| r.id).collect::<Vec<_>>(),
+    ];
+    rrf_merge(&rankings)
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, score)| {
+            by_id.iter().find(|r| r.id == id).map(|record| MemoryHit {
+                record: record.clone(),
+                score,
+            })
+        })
+        .collect()
 }
 
 /// Little-endian f32 bytes; the inverse of [`blob_to_vec`].

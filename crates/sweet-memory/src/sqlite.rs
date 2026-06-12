@@ -7,16 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use sweet_core::{
-    cosine_similarity, rrf_merge, unix_now, Embedder, Memory, MemoryError, MemoryHit, MemoryId,
-    MemoryQuery, MemoryRecord, MemoryScope,
+    cosine_similarity, unix_now, Embedder, Memory, MemoryError, MemoryHit, MemoryId, MemoryQuery,
+    MemoryRecord, MemoryScope,
 };
 
 use async_trait::async_trait;
 
 use crate::sqlite_shared::{
-    blob_to_vec, collect_records, filter_record, fts_match_expr, open_conn, row_to_record,
-    scope_filter, vec_to_blob, CANDIDATE_LIMIT, MEMORIES_TABLE_DDL, RECORD_COLUMNS,
-    RECORD_COLUMNS_QUALIFIED,
+    blob_to_vec, embed_query, filter_record, fts_candidates, fuse_hits, list_newest, open_conn,
+    row_to_record, scope_filter, vec_to_blob, CANDIDATE_LIMIT, MEMORIES_TABLE_DDL, RECORD_COLUMNS,
 };
 
 /// Persistent [`Memory`] store: one database file holds every scope.
@@ -79,32 +78,6 @@ impl SqliteMemory {
                 None
             }
         }
-    }
-
-    /// Keyword candidates, best (lowest bm25) first.
-    fn fts_candidates(
-        &self,
-        text: &str,
-        query: &MemoryQuery,
-    ) -> Result<Vec<MemoryRecord>, MemoryError> {
-        let match_expr = fts_match_expr(text);
-        if match_expr.is_empty() {
-            return Ok(Vec::new());
-        }
-        let (scope_clause, scope_params) = scope_filter(&query.scopes);
-        let sql = format!(
-            "SELECT {RECORD_COLUMNS_QUALIFIED} FROM memories_fts
-             JOIN memories ON memories.rowid = memories_fts.rowid
-             WHERE memories_fts MATCH ?1{scope_clause}
-             ORDER BY bm25(memories_fts) LIMIT {CANDIDATE_LIMIT}"
-        );
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare(&sql).map_err(MemoryError::storage)?;
-        let params_iter = std::iter::once(match_expr).chain(scope_params);
-        let rows = stmt
-            .query_map(params_from_iter(params_iter), row_to_record)
-            .map_err(MemoryError::storage)?;
-        collect_records(rows, query)
     }
 
     /// Semantic candidates, most similar first.
@@ -207,67 +180,24 @@ impl Memory for SqliteMemory {
         let text = query.text.as_deref().filter(|t| !t.trim().is_empty());
 
         let Some(text) = text else {
-            // List mode: newest first within the filters.
-            let (scope_clause, scope_params) = scope_filter(&query.scopes);
-            let sql = format!(
-                "SELECT {RECORD_COLUMNS} FROM memories WHERE 1=1{scope_clause}
-                 ORDER BY updated_at DESC, id DESC"
-            );
-            let records = {
-                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                let mut stmt = conn.prepare(&sql).map_err(MemoryError::storage)?;
-                let rows = stmt
-                    .query_map(params_from_iter(scope_params), row_to_record)
-                    .map_err(MemoryError::storage)?;
-                collect_records(rows, query)?
-            };
-            return Ok(records
-                .into_iter()
-                .take(query.limit)
-                .map(|record| MemoryHit { record, score: 0.0 })
-                .collect());
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            return list_newest(&conn, query);
         };
 
         // Embed the query before any lock is taken. No query vector (an
         // embedder returning nothing) skips the semantic pass.
-        let query_embedding = match &self.embedder {
-            Some(embedder) => embedder
-                .embed(&[text.to_string()])
-                .await
-                .map_err(|e| MemoryError::Embedding(e.into()))?
-                .pop()
-                .map(|v| (v, embedder.id().to_string())),
-            None => None,
-        };
+        let query_embedding = embed_query(self.embedder.as_deref(), text).await?;
 
-        let keyword = self.fts_candidates(text, query)?;
+        let keyword = {
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            fts_candidates(&conn, text, query)?
+        };
         let vector = match &query_embedding {
             Some((qv, embedder_id)) => self.vector_candidates(qv, embedder_id, query)?,
             None => Vec::new(),
         };
 
-        let mut by_id: Vec<MemoryRecord> = Vec::new();
-        for record in keyword.iter().chain(vector.iter()) {
-            if !by_id.iter().any(|r| r.id == record.id) {
-                by_id.push(record.clone());
-            }
-        }
-        let rankings = [
-            keyword.into_iter().map(|r| r.id).collect::<Vec<_>>(),
-            vector.into_iter().map(|r| r.id).collect::<Vec<_>>(),
-        ];
-        let fused = rrf_merge(&rankings);
-
-        Ok(fused
-            .into_iter()
-            .take(query.limit)
-            .filter_map(|(id, score)| {
-                by_id.iter().find(|r| r.id == id).map(|record| MemoryHit {
-                    record: record.clone(),
-                    score,
-                })
-            })
-            .collect())
+        Ok(fuse_hits(keyword, vector, query.limit))
     }
 
     async fn update(

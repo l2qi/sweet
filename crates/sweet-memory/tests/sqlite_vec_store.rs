@@ -221,6 +221,40 @@ async fn hybrid_search_fuses_semantic_ranking() {
     assert!(hits[0].record.content.contains("hot"));
 }
 
+#[tokio::test]
+async fn semantic_search_respects_scope_filter() {
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS)
+        .unwrap()
+        .with_embedder(Arc::new(FakeEmbedder { id: "fake/v1" }));
+    store
+        .save(user_scope(), "the stove is hot", &[], None)
+        .await
+        .unwrap();
+    store
+        .save(
+            MemoryScope::Project("p1".into()),
+            "the oven is hot",
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+    // "warm weather" is a semantic-only match for both records; the KNN scan
+    // can't filter scope in SQL, so the Rust-side filter must keep the user
+    // record out.
+    let hits = store
+        .search(
+            &MemoryQuery::new()
+                .with_text("warm weather")
+                .with_scopes([MemoryScope::Project("p1".into())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].record.content.contains("oven"));
+}
+
 /// Always produces vectors of the wrong size for a `VEC_DIMS` store.
 struct WrongDimsEmbedder;
 

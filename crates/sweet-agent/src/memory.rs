@@ -466,10 +466,22 @@ fn render_transcript(span: &[MemoryItem], max_chars_per_item: usize) -> String {
 
 /// The first top-level JSON array in `text`, tolerating markdown fences and
 /// prose around it.
+/// The first substring that parses as a JSON array: each `[` is tried in
+/// order, with serde finding the array's true end. Tolerates markdown fences
+/// and prose around the array — including prose containing brackets, which a
+/// greedy first-`[`-to-last-`]` span would swallow.
 fn extract_json_array(text: &str) -> Option<&str> {
-    let start = text.find('[')?;
-    let end = text.rfind(']')?;
-    (end > start).then(|| &text[start..=end])
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('[') {
+        let start = from + offset;
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde::de::IgnoredAny>();
+        if let Some(Ok(_)) = stream.next() {
+            return Some(&text[start..start + stream.byte_offset()]);
+        }
+        from = start + 1;
+    }
+    None
 }
 
 fn jaccard(a: &str, b: &str) -> f32 {
@@ -711,6 +723,22 @@ mod tests {
         );
         assert_eq!(extract_json_array("nothing here"), None);
         assert_eq!(extract_json_array("][ backwards"), None);
+    }
+
+    #[test]
+    fn extract_json_array_ignores_prose_brackets() {
+        // Brackets in prose are not a JSON array.
+        assert_eq!(extract_json_array("there are [no memories]. done."), None);
+        // Prose brackets after the array must not extend the span.
+        assert_eq!(
+            extract_json_array("[{\"a\":1}] — saved [1 item]"),
+            Some("[{\"a\":1}]")
+        );
+        // Prose brackets before the array must not start the span.
+        assert_eq!(
+            extract_json_array("from [the transcript]: [\"x\"]"),
+            Some("[\"x\"]")
+        );
     }
 
     #[test]
