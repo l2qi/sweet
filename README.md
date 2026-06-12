@@ -11,9 +11,10 @@ Sweet provides the building blocks for building autonomous AI agents: a composab
 | `sweet-core` | Core traits and types: `Model`, `Message`, `ToolSpec`, `Session`, `Sandbox` |
 | `sweet-tool-derive` | `#[derive(Tool)]` proc-macro for stateless tools |
 | `sweet-agent` | Agent loop, hooks, subagents, handoffs, and command routing |
-| `sweet-llm` | LLM provider implementations: OpenAI, Gemini, Anthropic |
+| `sweet-llm` | LLM provider and embedder implementations: OpenAI, Gemini, Anthropic |
 | `sweet-tools` | Universal built-in tools: HTTP fetch, web search, clock |
 | `sweet-session` | Session implementations: in-memory and SQLite-backed |
+| `sweet-memory` | Long-term memory: SQLite store with hybrid FTS5 + embedding recall, memory tools, optional sqlite-vec vector search |
 | `sweet-sandbox` | OS-level sandboxing: macOS Seatbelt and Linux Bubblewrap |
 | `sweet-mcp` | MCP tool provider via the official `rmcp` SDK |
 | `sweet-mcp-mock-server` | Mock MCP server for hermetic integration tests |
@@ -58,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `openai` | yes | OpenAI and OpenAI-compatible providers |
-| `gemini` | yes | Google Gemini provider |
+| `openai` | yes | OpenAI and OpenAI-compatible providers + `OpenAIEmbedder` |
+| `gemini` | yes | Google Gemini provider + `GeminiEmbedder` |
 | `anthropic` | yes | Anthropic Claude provider |
 
 ### sweet-tools
@@ -78,6 +79,13 @@ async fn main() -> anyhow::Result<()> {
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `sqlite` | no | SQLite-backed persistent session |
+
+### sweet-memory
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `sqlite` | no | SQLite-backed persistent memory store with FTS5 + brute-force cosine recall |
+| `sqlite-vec` | no | SQLite-backed memory store with FTS5 + sqlite-vec KNN vector search |
 
 ### sweet-agent
 

@@ -22,6 +22,9 @@ pub enum Error {
 
     #[error("session error: {0}")]
     Session(#[from] crate::session::SessionError),
+
+    #[error("memory error: {0}")]
+    Memory(#[from] crate::memory::MemoryError),
 }
 
 impl Error {

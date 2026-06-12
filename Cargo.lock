@@ -1912,6 +1912,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "sse-stream"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1938,7 +1947,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sweet-agent"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1952,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -1972,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-llm"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -1992,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-mcp"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "http",
@@ -2007,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-mcp-mock-server"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "axum",
  "rmcp",
@@ -2016,8 +2025,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "sweet-memory"
+version = "0.3.4"
+dependencies = [
+ "async-trait",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "sweet-core",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sweet-sandbox"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "dirs",
@@ -2032,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-session"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -2043,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-tool-derive"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2052,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "sweet-tools"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "chrono",
  "reqwest",

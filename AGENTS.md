@@ -6,11 +6,12 @@ Operational brief for coding agents (Claude Code, etc.) working in this repo. Re
 
 Sweet is an async, trait-based AI agent framework for Rust. It provides:
 
-- **Core abstractions** (`sweet-core`): `Model`, `Message`, `ToolSpec`, `Session`, `Sandbox`
+- **Core abstractions** (`sweet-core`): `Model`, `Message`, `ToolSpec`, `Session`, `Memory`, `Embedder`, `Sandbox`
 - **Agent loop** (`sweet-agent`): orchestration, tool dispatch, hooks, subagents, handoffs
 - **LLM providers** (`sweet-llm`): OpenAI, Gemini, Anthropic wire-protocol implementations
 - **Universal tools** (`sweet-tools`): HTTP fetch, web search, clock
 - **Session persistence** (`sweet-session`): in-memory and SQLite-backed
+- **Long-term memory** (`sweet-memory`): SQLite store with hybrid FTS5 + embedding recall, memory tools
 - **OS sandboxing** (`sweet-sandbox`): macOS Seatbelt, Linux Bubblewrap
 - **MCP integration** (`sweet-mcp`): MCP tool provider via the `rmcp` SDK
 
@@ -20,6 +21,7 @@ sweet-agent    → sweet-core
 sweet-llm      → sweet-core
 sweet-mcp      → sweet-core
 sweet-session  → sweet-core
+sweet-memory   → sweet-core
 sweet-tools    → sweet-core (with "derive" feature)
 sweet-sandbox  → sweet-core
 sweet-tool-derive → (standalone proc-macro, no sweet deps)
@@ -132,38 +134,48 @@ The `Sandbox` trait bundles runner + fs together to prevent mixing. `OsSandbox` 
 
 ## Mandatory pre-commit checklist
 
+Run `./scripts/check.sh`, which mirrors CI (`.github/workflows/ci.yml`) exactly:
+
 ```bash
+export RUSTFLAGS=-Dwarnings RUSTDOCFLAGS=-Dwarnings
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features
+cargo check --workspace
 cargo build -p sweet-mcp-mock-server
-cargo test --workspace
+cargo test --workspace --all-features
 cargo doc --workspace --no-deps --all-features
 ```
 
+If you change one, change the other — drift between them is how "passes locally,
+fails CI" happens (feature-gated tests skipped, doc warnings not denied).
+
 ## Git hygiene
 
+- **Never run `git commit` or `git push` (or open a PR) without the owner's explicit approval.** A green pre-commit checklist is a prerequisite, not authorization.
+- Do not amend or rewrite an existing commit on your own initiative — the owner may have pushed it. Default to a follow-up commit; if amending seems like the better call, ask first.
 - Do not skip hooks (`--no-verify`). Fix the underlying issue.
 - Write commit messages in the imperative mood, ≤ 72 chars for the subject.
-- Never push or open a PR without explicit instruction.
 
 ## Crate-by-crate quick reference
 
 ### sweet-core
 
-Public surface: `Message`, `Role`, `ToolCall`, `ThinkingContent`, `Model` (trait), `StreamSink`, `NoopSink`, `ToolSpec`, `ToolHandler`, `ToolFn`, `ToolError`, `Session`, `InMemorySession`, `SessionId`, `SessionError`, `MemoryItem`, `SharedSession`, `SharedSessionHandle`, `Error`, `Result`, `SWEET_VERSION`, `CommandRunner`, `CommandOutput`, `Filesystem`, `FileMetadata`, `DirEntry`, `SearchMatch`, `Sandbox`, `SandboxPolicy`, `SandboxError`, `DirectRunner`, `DirectFs`, `DirectSandbox`.
+Public surface: `Message`, `Role`, `ToolCall`, `ThinkingContent`, `Model` (trait), `Embedder` (trait), `StreamSink`, `NoopSink`, `ToolSpec`, `ToolHandler`, `ToolFn`, `ToolError`, `Session`, `InMemorySession`, `SessionId`, `SessionError`, `MemoryItem`, `SharedSession`, `SharedSessionHandle`, `Memory` (trait), `EphemeralMemory`, `MemoryId`, `MemoryScope`, `MemoryRecord`, `MemoryQuery`, `MemoryHit`, `MemoryError`, `Error`, `Result`, `SWEET_VERSION`, `CommandRunner`, `CommandOutput`, `Filesystem`, `FileMetadata`, `DirEntry`, `SearchMatch`, `Sandbox`, `SandboxPolicy`, `SandboxError`, `DirectRunner`, `DirectFs`, `DirectSandbox`.
 
 - `Message.thinking_content: Vec<ThinkingContent>` carries chain-of-thought blocks.
+- `Session` (one conversation's transcript) vs `Memory` (durable records across conversations): both traits live here; `EphemeralMemory` is the Vec-backed default, `SqliteMemory` lives in `sweet-memory`. `MemoryScope` keys (`User`/`Project`/`Session`) are application-chosen — never model-chosen.
 - `StreamSink::on_thinking_delta()` receives incremental thinking text during streaming.
 
 ### sweet-agent
 
-Public surface: `Agent`, `AgentIo`, `RunOutcome`, `run()`, `TurnResult`, `HandoffSpec`, `HandoffHandler`, `HandoffContext`, `HandoffResult`, `SubagentSpec`, `SubagentHandler`, `SubagentContext`, `DEFAULT_MAX_DEPTH`, `Capability`, `CapabilityProvider`, `Extension`, `ExtensionRegistry`, `ToolCapabilities`, `PromptSpec`, `Activation`, `DynamicPrompt`, `HookEvent`, `HookCapability`, `HookInvocation`, `HookDispatcher`, `ProcedureSpec`, `ProcedureHandler`, `CommandSpec`, `CommandHandler`, `CommandContext`, `CommandRouter`.
+Public surface: `Agent`, `AgentIo`, `RunOutcome`, `run()`, `TurnResult`, `HandoffSpec`, `HandoffHandler`, `HandoffContext`, `HandoffResult`, `SubagentSpec`, `SubagentHandler`, `SubagentContext`, `DEFAULT_MAX_DEPTH`, `Capability`, `CapabilityProvider`, `Extension`, `ExtensionRegistry`, `ToolCapabilities`, `PromptSpec`, `Activation`, `DynamicPrompt`, `HookEvent`, `HookCapability`, `HookInvocation`, `HookDispatcher`, `ProcedureSpec`, `ProcedureHandler`, `CommandSpec`, `CommandHandler`, `CommandContext`, `CommandRouter`, `MemoryRecall`, `DistillConfig`, `memory_recall_capabilities`, `memory_distill_capabilities`.
 
 - Depends **only on `sweet-core`** — never on `sweet-llm` or any provider crate.
 - `Agent::step()` appends user message, fires hooks, calls `model.complete()`, dispatches tool calls (parallel for `ReadOnly`, sequential for writes/dangerous), and returns the final assistant message.
 - `ToolCapabilities` is a named bundle of `ToolSpec`s that implements `CapabilityProvider`.
 - `Activation::Always` prompts are composed into system instructions every turn; `Activation::ByCommand(name)` prompts are template-only, dispatched by name.
 - `DynamicPrompt` re-renders into the system prompt each turn from interior-mutable shared state.
+- Long-term memory wiring (`src/memory.rs`) works against the `Memory` trait only: `memory_recall_capabilities` refreshes a `MemoryRecall` dynamic prompt from the latest user message (`BeforeTurn`); `memory_distill_capabilities` periodically extracts durable facts via a model call (`AfterTurn`, watermark-gated, dedup'd). Wire on top-level agents only — never on subagent scratch sessions.
 
 Feature flags:
 
@@ -173,17 +185,18 @@ Feature flags:
 
 ### sweet-llm
 
-Public surface: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `ProviderError`. Per-provider thinking config: `openai::ThinkingMode`, `openai::ReasoningContent`, `anthropic::ThinkingConfig`.
+Public surface: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `OpenAIEmbedder`, `GeminiEmbedder`, `ProviderError`. Per-provider thinking config: `openai::ThinkingMode`, `openai::ReasoningContent`, `anthropic::ThinkingConfig`.
 
 - `OpenAIProvider` supports thinking-mode models via OpenAI-compatible wire format.
 - `AnthropicProvider` supports native thinking blocks; configure with `AnthropicProvider::with_thinking(ThinkingConfig)`.
+- Embedders follow the provider builder pattern (`new`, `from_env`, `with_base_url`, `with_model`). No Anthropic embedder — Anthropic has no embeddings API (their docs point at Voyage AI).
 
 Feature flags:
 
 | Flag | Pulls in |
 |------|---------|
-| `openai` | `OpenAIProvider` |
-| `gemini` | `GeminiProvider` |
+| `openai` | `OpenAIProvider`, `OpenAIEmbedder` |
+| `gemini` | `GeminiProvider`, `GeminiEmbedder` |
 | `anthropic` | `AnthropicProvider` |
 | (default) | all of the above |
 
@@ -205,6 +218,23 @@ Feature flags:
 ### sweet-session
 
 Public surface: re-exports `Session`, `InMemorySession`, `SessionId`, `MemoryItem` from `sweet-core`; adds `SqliteSession` behind the `sqlite` feature.
+
+`SqliteSession` keeps compacted-away rows in the same db marked `archived` (invisible to the `Session` trait) instead of deleting them; `full_messages()` / `full_items()` (inherent methods, reach them via `as_any` downcast) return the complete transcript in order. Ordering uses a fractional `position REAL` column.
+
+### sweet-memory
+
+Public surface: re-exports the core memory types; adds `SqliteMemory` behind the `sqlite` feature and `SqliteVecMemory` behind the `sqlite-vec` feature, plus `MemoryToolset` and the `memory_tools` / `memory_save_tool` / `memory_search_tool` / `memory_update_tool` / `memory_delete_tool` factories.
+
+- `SqliteMemory` recall is hybrid: FTS5 bm25 + brute-force cosine over embedded rows, fused with Reciprocal Rank Fusion. Vectors are tagged with `Embedder::id()`; rows from a different embedder stay keyword-searchable only.
+- `SqliteVecMemory` is like `SqliteMemory` but uses `sqlite-vec` for vector similarity search (KNN via vec0 virtual table) instead of brute-force cosine. Better suited for large-scale deployments.
+- Tool scopes are bound by the application in `MemoryToolset` — search/update/delete refuse records outside `searchable_scopes`.
+
+Feature flags:
+
+| Flag | Pulls in |
+|------|---------|
+| `sqlite` | `SqliteMemory` (rusqlite, bundled FTS5) |
+| `sqlite-vec` | `SqliteVecMemory` (rusqlite, bundled FTS5, sqlite-vec) |
 
 ### sweet-mcp
 

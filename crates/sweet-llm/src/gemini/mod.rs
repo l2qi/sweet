@@ -24,6 +24,9 @@ use crate::error::ProviderError;
 use crate::schema::sanitize_schema;
 use crate::util::provider_error_from_core;
 
+mod embeddings;
+pub use embeddings::{GeminiEmbedder, DEFAULT_EMBEDDING_MODEL, DEFAULT_OUTPUT_DIMENSIONALITY};
+
 mod wire;
 
 // ---------------------------------------------------------------------------

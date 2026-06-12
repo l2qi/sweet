@@ -6,6 +6,7 @@ members = [
     "crates/sweet-llm",
     "crates/sweet-agent",
     "crates/sweet-session",
+    "crates/sweet-memory",
     "crates/sweet-sandbox",
     "crates/sweet-mcp",
     "crates/sweet-mcp-mock-server",
@@ -13,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
