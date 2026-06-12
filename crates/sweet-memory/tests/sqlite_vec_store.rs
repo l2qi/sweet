@@ -1,14 +1,17 @@
 // Copyright (C) 2026 Ryuichi Intellectual Property LLC and the Sweet project contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "sqlite")]
+#![cfg(feature = "sqlite-vec")]
 
 use std::sync::Arc;
 
 use sweet_core::{
     async_trait, Embedder, Memory, MemoryError, MemoryQuery, MemoryScope, Result as CoreResult,
 };
-use sweet_memory::SqliteMemory;
+use sweet_memory::SqliteVecMemory;
+
+/// Vector dimensionality for FakeEmbedder (2-dim).
+const VEC_DIMS: usize = 2;
 
 fn user_scope() -> MemoryScope {
     MemoryScope::User("u1".into())
@@ -16,7 +19,7 @@ fn user_scope() -> MemoryScope {
 
 #[tokio::test]
 async fn crud_roundtrip() {
-    let store = SqliteMemory::open(":memory:").unwrap();
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS).unwrap();
 
     let saved = store
         .save(user_scope(), "prefers tabs", &["style".into()], Some("s1"))
@@ -45,14 +48,14 @@ async fn persists_across_reopen() {
     let path = dir.path().join("memory.db");
 
     let saved = {
-        let store = SqliteMemory::open(&path).unwrap();
+        let store = SqliteVecMemory::open(&path, VEC_DIMS).unwrap();
         store
             .save(user_scope(), "durable fact", &[], None)
             .await
             .unwrap()
     };
 
-    let store = SqliteMemory::open(&path).unwrap();
+    let store = SqliteVecMemory::open(&path, VEC_DIMS).unwrap();
     let fetched = store.get(&saved.id).await.unwrap().unwrap();
     assert_eq!(fetched, saved);
 
@@ -65,8 +68,28 @@ async fn persists_across_reopen() {
 }
 
 #[tokio::test]
+async fn dimension_mismatch_on_reopen_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.db");
+
+    // First open with 2 dimensions.
+    {
+        let _store = SqliteVecMemory::open(&path, 2).unwrap();
+    }
+
+    // Reopen with 4 dimensions — should error.
+    let result = SqliteVecMemory::open(&path, 4);
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("dimensionality mismatch"),
+        "expected dimension mismatch error, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
 async fn fts_search_ranks_and_filters() {
-    let store = SqliteMemory::open(":memory:").unwrap();
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS).unwrap();
     store
         .save(user_scope(), "the user prefers dark mode", &[], None)
         .await
@@ -119,7 +142,7 @@ async fn fts_search_ranks_and_filters() {
 
 #[tokio::test]
 async fn list_mode_returns_newest_first() {
-    let store = SqliteMemory::open(":memory:").unwrap();
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS).unwrap();
     store.save(user_scope(), "first", &[], None).await.unwrap();
     store.save(user_scope(), "second", &[], None).await.unwrap();
 
@@ -135,7 +158,7 @@ async fn list_mode_returns_newest_first() {
 
 #[tokio::test]
 async fn malicious_fts_queries_are_treated_as_text() {
-    let store = SqliteMemory::open(":memory:").unwrap();
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS).unwrap();
     store
         .save(user_scope(), "plain content here", &[], None)
         .await
@@ -176,7 +199,7 @@ impl Embedder for FakeEmbedder {
 
 #[tokio::test]
 async fn hybrid_search_fuses_semantic_ranking() {
-    let store = SqliteMemory::open(":memory:")
+    let store = SqliteVecMemory::open(":memory:", VEC_DIMS)
         .unwrap()
         .with_embedder(Arc::new(FakeEmbedder { id: "fake/v1" }));
     store
@@ -205,7 +228,7 @@ async fn mismatched_embedder_rows_stay_keyword_searchable() {
 
     // Saved under embedder v1...
     {
-        let store = SqliteMemory::open(&path)
+        let store = SqliteVecMemory::open(&path, VEC_DIMS)
             .unwrap()
             .with_embedder(Arc::new(FakeEmbedder { id: "fake/v1" }));
         store
@@ -216,7 +239,7 @@ async fn mismatched_embedder_rows_stay_keyword_searchable() {
 
     // ...reopened under embedder v2: the old vector must not participate in
     // the semantic pass, but keyword recall still finds the record.
-    let store = SqliteMemory::open(&path)
+    let store = SqliteVecMemory::open(&path, VEC_DIMS)
         .unwrap()
         .with_embedder(Arc::new(FakeEmbedder { id: "fake/v2" }));
 

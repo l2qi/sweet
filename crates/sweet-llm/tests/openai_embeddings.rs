@@ -13,13 +13,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 fn id_reflects_model() {
     assert_eq!(
         OpenAIEmbedder::new("k").id(),
-        format!("openai/{}", openai::DEFAULT_EMBEDDING_MODEL)
+        openai::DEFAULT_EMBEDDING_MODEL
     );
     assert_eq!(
         OpenAIEmbedder::new("k")
             .with_model("text-embedding-3-large")
             .id(),
-        "openai/text-embedding-3-large"
+        "text-embedding-3-large"
     );
 }
 

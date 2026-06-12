@@ -23,7 +23,7 @@ pub struct OpenAIEmbedder {
     api_key: String,
     model: String,
     user_agent: String,
-    /// Cached `"openai/{model}"`, kept in sync with `model` so
+    /// Cached model name, kept in sync with `model` so
     /// [`Embedder::id`] can return a borrow.
     id: String,
 }
@@ -38,7 +38,7 @@ impl OpenAIEmbedder {
             api_key: api_key.into(),
             model: DEFAULT_EMBEDDING_MODEL.to_string(),
             user_agent: format!("sweet/{SWEET_VERSION}"),
-            id: format!("openai/{DEFAULT_EMBEDDING_MODEL}"),
+            id: DEFAULT_EMBEDDING_MODEL.to_string(),
         }
     }
 
@@ -58,7 +58,7 @@ impl OpenAIEmbedder {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
-        self.id = format!("openai/{}", self.model);
+        self.id = self.model.clone();
         self
     }
 

@@ -26,8 +26,8 @@ pub struct GeminiEmbedder {
     model: String,
     output_dimensionality: usize,
     user_agent: String,
-    /// Cached `"gemini/{model}/{dims}"`. Dimensionality is part of the
-    /// identity: vectors of different sizes are not comparable.
+    /// Cached `"{model}/{dims}"`. Dimensionality is part of the identity:
+    /// vectors of different sizes are not comparable.
     id: String,
 }
 
@@ -42,7 +42,7 @@ impl GeminiEmbedder {
             model: DEFAULT_EMBEDDING_MODEL.to_string(),
             output_dimensionality: DEFAULT_OUTPUT_DIMENSIONALITY,
             user_agent: format!("sweet/{SWEET_VERSION}"),
-            id: format!("gemini/{DEFAULT_EMBEDDING_MODEL}/{DEFAULT_OUTPUT_DIMENSIONALITY}"),
+            id: format!("{DEFAULT_EMBEDDING_MODEL}/{DEFAULT_OUTPUT_DIMENSIONALITY}"),
         }
     }
 
@@ -84,7 +84,7 @@ impl GeminiEmbedder {
     }
 
     fn refresh_id(&mut self) {
-        self.id = format!("gemini/{}/{}", self.model, self.output_dimensionality);
+        self.id = format!("{}/{}", self.model, self.output_dimensionality);
     }
 
     async fn embed_inner(

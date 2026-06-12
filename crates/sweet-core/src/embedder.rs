@@ -17,10 +17,10 @@ pub trait Embedder: Send + Sync {
     /// Embed each input text, returning one vector per input, in order.
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
 
-    /// Stable identifier for the provider/model/dimensions combination, e.g.
-    /// `"openai/text-embedding-3-small"`. Stores persist it next to each
-    /// vector: vectors from different embedders are not comparable, so this
-    /// is what keeps them from being mixed.
+    /// Stable identifier for the model/dimensions combination, e.g.
+    /// `"text-embedding-3-small"` or `"gemini-embedding-001/768"`. Stores
+    /// persist it next to each vector: vectors from different embedders are
+    /// not comparable, so this is what keeps them from being mixed.
     fn id(&self) -> &str;
 }
 

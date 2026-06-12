@@ -156,7 +156,7 @@ cargo doc --workspace --no-deps --all-features
 Public surface: `Message`, `Role`, `ToolCall`, `ThinkingContent`, `Model` (trait), `Embedder` (trait), `StreamSink`, `NoopSink`, `ToolSpec`, `ToolHandler`, `ToolFn`, `ToolError`, `Session`, `InMemorySession`, `SessionId`, `SessionError`, `MemoryItem`, `SharedSession`, `SharedSessionHandle`, `Memory` (trait), `EphemeralMemory`, `MemoryId`, `MemoryScope`, `MemoryRecord`, `MemoryQuery`, `MemoryHit`, `MemoryError`, `Error`, `Result`, `SWEET_VERSION`, `CommandRunner`, `CommandOutput`, `Filesystem`, `FileMetadata`, `DirEntry`, `SearchMatch`, `Sandbox`, `SandboxPolicy`, `SandboxError`, `DirectRunner`, `DirectFs`, `DirectSandbox`.
 
 - `Message.thinking_content: Vec<ThinkingContent>` carries chain-of-thought blocks.
-- `Session` (one conversation's transcript) vs `Memory` (durable records across conversations): both traits live here; `EphemeralMemory` is the Vec-backed default, `SqliteMemoryStore` lives in `sweet-memory`. `MemoryScope` keys (`User`/`Project`/`Session`) are application-chosen — never model-chosen.
+- `Session` (one conversation's transcript) vs `Memory` (durable records across conversations): both traits live here; `EphemeralMemory` is the Vec-backed default, `SqliteMemory` lives in `sweet-memory`. `MemoryScope` keys (`User`/`Project`/`Session`) are application-chosen — never model-chosen.
 - `StreamSink::on_thinking_delta()` receives incremental thinking text during streaming.
 
 ### sweet-agent
@@ -216,16 +216,18 @@ Public surface: re-exports `Session`, `InMemorySession`, `SessionId`, `MemoryIte
 
 ### sweet-memory
 
-Public surface: re-exports the core memory types; adds `SqliteMemoryStore` behind the `sqlite` feature, plus `MemoryToolset` and the `memory_tools` / `memory_save_tool` / `memory_search_tool` / `memory_update_tool` / `memory_delete_tool` factories.
+Public surface: re-exports the core memory types; adds `SqliteMemory` behind the `sqlite` feature and `SqliteVecMemory` behind the `sqlite-vec` feature, plus `MemoryToolset` and the `memory_tools` / `memory_save_tool` / `memory_search_tool` / `memory_update_tool` / `memory_delete_tool` factories.
 
-- `SqliteMemoryStore` recall is hybrid: FTS5 bm25 + brute-force cosine over embedded rows, fused with Reciprocal Rank Fusion. Vectors are tagged with `Embedder::id()`; rows from a different embedder stay keyword-searchable only.
+- `SqliteMemory` recall is hybrid: FTS5 bm25 + brute-force cosine over embedded rows, fused with Reciprocal Rank Fusion. Vectors are tagged with `Embedder::id()`; rows from a different embedder stay keyword-searchable only.
+- `SqliteVecMemory` is like `SqliteMemory` but uses `sqlite-vec` for vector similarity search (KNN via vec0 virtual table) instead of brute-force cosine. Better suited for large-scale deployments.
 - Tool scopes are bound by the application in `MemoryToolset` — search/update/delete refuse records outside `searchable_scopes`.
 
 Feature flags:
 
 | Flag | Pulls in |
 |------|---------|
-| `sqlite` | `SqliteMemoryStore` (rusqlite, bundled FTS5) |
+| `sqlite` | `SqliteMemory` (rusqlite, bundled FTS5) |
+| `sqlite-vec` | `SqliteVecMemory` (rusqlite, bundled FTS5, sqlite-vec) |
 
 ### sweet-mcp
 

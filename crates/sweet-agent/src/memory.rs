@@ -4,7 +4,7 @@
 //! Turnkey long-term memory wiring for agents.
 //!
 //! Two independent pieces, both working against the [`Memory`] trait from
-//! `sweet-core` (so any store — `EphemeralMemory`, `SqliteMemoryStore` from
+//! `sweet-core` (so any store — `EphemeralMemory`, `SqliteMemory` from
 //! `sweet-memory`, or a custom backend — plugs in):
 //!
 //! - **Recall**: [`MemoryRecall`] renders relevant memories into the system

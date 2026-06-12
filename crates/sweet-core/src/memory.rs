@@ -12,7 +12,7 @@
 //! This module defines the vocabulary plus [`EphemeralMemory`], a Vec-backed
 //! implementation mirroring [`InMemorySession`](crate::InMemorySession) —
 //! suitable for tests and ephemeral agents. The persistent, searchable
-//! implementation (`SqliteMemoryStore`) lives in the `sweet-memory` crate.
+//! implementation (`SqliteMemory`) lives in the `sweet-memory` crate.
 
 use std::error::Error as StdError;
 use std::sync::{Arc, Mutex};
@@ -302,7 +302,7 @@ struct EphemeralEntry {
 ///
 /// Keyword recall uses token-overlap scoring; with an [`Embedder`] attached,
 /// cosine similarity over embedded records is fused in via [`rrf_merge`].
-/// Nothing survives the process — use `SqliteMemoryStore` from `sweet-memory`
+/// Nothing survives the process — use `SqliteMemory` from `sweet-memory`
 /// for persistence.
 pub struct EphemeralMemory {
     entries: Mutex<Vec<EphemeralEntry>>,

@@ -14,7 +14,7 @@ fn id_includes_model_and_dimensionality() {
     assert_eq!(
         GeminiEmbedder::new("k").id(),
         format!(
-            "gemini/{}/{}",
+            "{}/{}",
             gemini::DEFAULT_EMBEDDING_MODEL,
             gemini::DEFAULT_OUTPUT_DIMENSIONALITY
         )
@@ -24,7 +24,7 @@ fn id_includes_model_and_dimensionality() {
             .with_model("other-embedding")
             .with_output_dimensionality(128)
             .id(),
-        "gemini/other-embedding/128"
+        "other-embedding/128"
     );
 }
 
