@@ -38,7 +38,8 @@ pub use hooks::{
 };
 pub use memory::{
     memory_distill_capabilities, memory_distiller_capabilities, memory_recall_capabilities,
-    DistillConfig, MemoryDistiller, MemoryRecall, DISTILL_PROCEDURE_ID, RECALL_PROCEDURE_ID,
+    DistillConfig, DistillError, DistillReport, MemoryDistiller, MemoryRecall, SpanClaim,
+    DISTILL_PROCEDURE_ID, RECALL_PROCEDURE_ID,
 };
 pub use runloop::{run, AgentIo, RunOutcome};
 pub use subagent::{SubagentContext, SubagentHandler, SubagentSpec, DEFAULT_MAX_DEPTH};

@@ -168,14 +168,14 @@ Public surface: `Message`, `Role`, `ToolCall`, `ThinkingContent`, `Model` (trait
 
 ### sweet-agent
 
-Public surface: `Agent`, `AgentIo`, `RunOutcome`, `run()`, `TurnResult`, `HandoffSpec`, `HandoffHandler`, `HandoffContext`, `HandoffResult`, `SubagentSpec`, `SubagentHandler`, `SubagentContext`, `DEFAULT_MAX_DEPTH`, `Capability`, `CapabilityProvider`, `Extension`, `ExtensionRegistry`, `ToolCapabilities`, `PromptSpec`, `Activation`, `DynamicPrompt`, `HookEvent`, `HookCapability`, `HookInvocation`, `HookDispatcher`, `ProcedureSpec`, `ProcedureHandler`, `CommandSpec`, `CommandHandler`, `CommandContext`, `CommandRouter`, `MemoryRecall`, `DistillConfig`, `memory_recall_capabilities`, `memory_distill_capabilities`.
+Public surface: `Agent`, `AgentIo`, `RunOutcome`, `run()`, `TurnResult`, `HandoffSpec`, `HandoffHandler`, `HandoffContext`, `HandoffResult`, `SubagentSpec`, `SubagentHandler`, `SubagentContext`, `DEFAULT_MAX_DEPTH`, `Capability`, `CapabilityProvider`, `Extension`, `ExtensionRegistry`, `ToolCapabilities`, `PromptSpec`, `Activation`, `DynamicPrompt`, `HookEvent`, `HookCapability`, `HookInvocation`, `HookDispatcher`, `ProcedureSpec`, `ProcedureHandler`, `CommandSpec`, `CommandHandler`, `CommandContext`, `CommandRouter`, `MemoryRecall`, `MemoryDistiller`, `DistillConfig`, `DistillReport`, `DistillError`, `SpanClaim`, `memory_recall_capabilities`, `memory_distill_capabilities`, `memory_distiller_capabilities`.
 
 - Depends **only on `sweet-core`** — never on `sweet-llm` or any provider crate.
 - `Agent::step()` appends user message, fires hooks, calls `model.complete()`, dispatches tool calls (parallel for `ReadOnly`, sequential for writes/dangerous), and returns the final assistant message.
 - `ToolCapabilities` is a named bundle of `ToolSpec`s that implements `CapabilityProvider`.
 - `Activation::Always` prompts are composed into system instructions every turn; `Activation::ByCommand(name)` prompts are template-only, dispatched by name.
 - `DynamicPrompt` re-renders into the system prompt each turn from interior-mutable shared state.
-- Long-term memory wiring (`src/memory.rs`) works against the `Memory` trait only: `memory_recall_capabilities` refreshes a `MemoryRecall` dynamic prompt from the latest user message (`BeforeTurn`); `memory_distill_capabilities` periodically extracts durable facts via a model call (`AfterTurn`, watermark-gated, dedup'd). Wire on top-level agents only — never on subagent scratch sessions.
+- Long-term memory wiring (`src/memory.rs`) works against the `Memory` trait only: `memory_recall_capabilities` refreshes a `MemoryRecall` dynamic prompt from the latest user message (`BeforeTurn`); `memory_distill_capabilities` periodically extracts durable facts via a model call (`AfterTurn`, watermark-gated, dedup'd). Interactive apps that must not block on the distill call drive `MemoryDistiller` directly: `claim_span` synchronously, then `distill_span` (model + items snapshot, returns a `DistillReport`) from a background task. Wire on top-level agents only — never on subagent scratch sessions.
 
 Feature flags:
 

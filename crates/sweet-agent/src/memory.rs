@@ -16,6 +16,10 @@
 //! - **Distillation**: [`memory_distill_capabilities`] contributes an
 //!   `AfterTurn` procedure that periodically asks the model to extract
 //!   durable facts from the transcript and saves them to the store.
+//!   Interactive apps that must not block on the distill model call can
+//!   instead drive [`MemoryDistiller`] themselves: claim a span
+//!   synchronously, then run [`MemoryDistiller::distill_span`] from a
+//!   background task.
 //!
 //! Wire both only on top-level agents — an ephemeral subagent session should
 //! not distill into long-term memory.
@@ -25,7 +29,8 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 
 use sweet_core::{
-    Memory, MemoryError, MemoryItem, MemoryQuery, MemoryScope, Message, Result, Role,
+    Memory, MemoryError, MemoryItem, MemoryQuery, MemoryRecord, MemoryScope, Message, Model,
+    Result, Role,
 };
 
 use crate::commands::CommandContext;
@@ -194,13 +199,21 @@ struct DistillItem {
 /// The distillation engine: extracts durable facts from transcript spans
 /// via a model call and saves them to the store.
 ///
-/// Normally driven by the `AfterTurn` procedure from
-/// [`memory_distill_capabilities`], which applies the cadence gate. Apps can
-/// additionally hold an `Arc<MemoryDistiller>` (see
-/// [`memory_distiller_capabilities`]) and call [`run_now`](Self::run_now) at
-/// natural boundaries — session rotation, clean exit — to flush a span that
-/// hasn't reached the cadence yet. The watermark is shared, so the two paths
-/// never re-distill the same items.
+/// Three ways to drive it:
+///
+/// - The `AfterTurn` procedure from [`memory_distill_capabilities`], which
+///   applies the cadence gate in-turn (fine for non-interactive agents; it
+///   runs a model call before the turn returns).
+/// - [`run_now`](Self::run_now) at natural boundaries — session rotation,
+///   clean exit — to flush a span that hasn't reached the cadence yet.
+/// - Off the critical path: hold an `Arc<MemoryDistiller>` (see
+///   [`memory_distiller_capabilities`]), [`claim_span`](Self::claim_span)
+///   synchronously, then run [`distill_span`](Self::distill_span) from a
+///   background task with a snapshot of the items and the model — so an
+///   interactive UI never waits on the distill model call.
+///
+/// The watermark is shared across all paths, so the same items are never
+/// distilled twice.
 pub struct MemoryDistiller {
     store: Arc<dyn Memory>,
     scope: MemoryScope,
@@ -208,6 +221,17 @@ pub struct MemoryDistiller {
     /// Session item count at the last distillation. In-process only: after a
     /// restart one redundant pass may run, which dedup absorbs.
     watermark: Mutex<usize>,
+}
+
+/// A claimed, not-yet-distilled span: the start index into the session's
+/// items at claim time. Returned by [`MemoryDistiller::claim_span`] and
+/// consumed by [`MemoryDistiller::distill_span`]. Holding one is proof the
+/// watermark was advanced, so a span is never distilled without a claim, nor
+/// claimed without being distilled.
+#[derive(Debug)]
+#[must_use = "a claimed span advanced the watermark; pass it to distill_span or it is lost"]
+pub struct SpanClaim {
+    start: usize,
 }
 
 impl MemoryDistiller {
@@ -220,10 +244,21 @@ impl MemoryDistiller {
         }
     }
 
-    /// Claim the undistilled span, or `None` when it is under `min_items`.
-    /// Advances the watermark immediately: a span that fails to distill is
-    /// skipped, not retried every turn.
-    fn claim_span(&self, session_len: usize, min_items: usize) -> Option<usize> {
+    /// The tuning this distiller was built with (callers scheduling their
+    /// own passes need `min_new_items` for the cadence gate).
+    pub fn config(&self) -> &DistillConfig {
+        &self.config
+    }
+
+    /// Claim the undistilled span as a [`SpanClaim`], or `None` when fewer
+    /// than `min_items` new items have accumulated.
+    ///
+    /// Advances the watermark immediately — claim *before* spawning a
+    /// background [`distill_span`](Self::distill_span) so concurrent paths
+    /// can't double-claim, and a span that fails to distill is skipped, not
+    /// retried every turn. The returned claim is the only way to call
+    /// `distill_span`, so the two can't get out of order.
+    pub fn claim_span(&self, session_len: usize, min_items: usize) -> Option<SpanClaim> {
         let mut watermark = self.watermark.lock().unwrap_or_else(|e| e.into_inner());
         // Compaction can shrink the session below the watermark; restart
         // the window rather than waiting for it to regrow past stale state.
@@ -234,18 +269,34 @@ impl MemoryDistiller {
         if session_len - *watermark < min_items.max(1) {
             return None;
         }
-        Some(std::mem::replace(&mut *watermark, session_len))
+        let start = std::mem::replace(&mut *watermark, session_len);
+        Some(SpanClaim { start })
     }
 
     /// Distill whatever is undistilled right now, ignoring the cadence gate.
     /// Failures are logged, never returned — same contract as the hook path.
     pub async fn run_now(&self, ctx: &mut dyn CommandContext) {
+        self.run_with_ctx(ctx, 1).await;
+    }
+
+    /// Claim with `min_items`, then distill using the context's model and
+    /// session — the shared body of the in-turn paths.
+    async fn run_with_ctx(&self, ctx: &mut dyn CommandContext, min_items: usize) {
         let items = ctx.session().items().to_vec();
-        let Some(span_start) = self.claim_span(items.len(), 1) else {
+        let Some(claim) = self.claim_span(items.len(), min_items) else {
             return;
         };
-        if let Err(err) = self.distill(ctx, &items[span_start..]).await {
-            tracing::warn!("memory distillation failed: {err}");
+        let session_id = ctx.session().id().to_string();
+        match self
+            .distill_span(ctx.model(), claim, &items, &session_id)
+            .await
+        {
+            Ok(report) => tracing::debug!(
+                saved = report.saved.len(),
+                updated = report.updated,
+                "memory distillation pass complete"
+            ),
+            Err(err) => tracing::warn!("memory distillation failed: {err}"),
         }
     }
 }
@@ -261,31 +312,71 @@ impl ProcedureHandler for MemoryDistillProcedure {
         _invocation: &HookInvocation,
         ctx: &mut dyn CommandContext,
     ) -> Result<()> {
-        let items = ctx.session().items().to_vec();
-        let Some(span_start) = self
-            .distiller
-            .claim_span(items.len(), self.distiller.config.min_new_items)
-        else {
-            return Ok(());
-        };
-
-        // Nothing below may fail the user's turn: log and move on.
-        if let Err(err) = self.distiller.distill(ctx, &items[span_start..]).await {
-            tracing::warn!("memory distillation failed: {err}");
-        }
+        // Nothing in the pass may fail the user's turn: errors are logged
+        // inside and never surface here.
+        self.distiller
+            .run_with_ctx(ctx, self.distiller.config.min_new_items)
+            .await;
         Ok(())
     }
 }
 
+/// What a distillation pass wrote to the store.
+#[derive(Debug, Default, Clone)]
+pub struct DistillReport {
+    /// Newly saved memories.
+    pub saved: Vec<MemoryRecord>,
+    /// Number of existing memories rewritten in place.
+    pub updated: usize,
+}
+
+/// Why a distillation pass failed.
+///
+/// Only failures that abort the whole pass appear here. Individual store
+/// writes are best-effort: a failed save or update is logged and skipped,
+/// reflected by its absence from the [`DistillReport`], not by an error.
+#[derive(Debug, thiserror::Error)]
+pub enum DistillError {
+    /// The distill model call failed.
+    #[error("distill model call failed: {0}")]
+    Model(#[from] sweet_core::Error),
+    /// The model's reply could not be parsed into distill items.
+    #[error("unparseable distill reply: {0}")]
+    Parse(String),
+}
+
 impl MemoryDistiller {
-    async fn distill(
+    /// Distill the [`SpanClaim`]'s slice of `items` and write the extracted
+    /// facts to the store.
+    ///
+    /// Takes a `claim` (from [`claim_span`](Self::claim_span)) and the full
+    /// item snapshot rather than a `CommandContext`, so it can run detached
+    /// from the agent — claiming on the turn thread, distilling off it.
+    /// `items` must be the session snapshot the claim was made against;
+    /// `source_session` is recorded as provenance on saves.
+    pub async fn distill_span(
         &self,
-        ctx: &mut dyn CommandContext,
-        span: &[MemoryItem],
-    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        model: &dyn Model,
+        claim: SpanClaim,
+        items: &[MemoryItem],
+        source_session: &str,
+    ) -> std::result::Result<DistillReport, DistillError> {
+        let mut report = DistillReport::default();
+        // `items` must be the snapshot the claim was made against. A shorter
+        // slice (a violated contract — e.g. a stale snapshot after compaction)
+        // has nothing at the claimed start: surface it rather than silently
+        // distilling an empty span.
+        let Some(span) = items.get(claim.start..) else {
+            tracing::warn!(
+                claim_start = claim.start,
+                items = items.len(),
+                "distill span skipped: items shorter than claim start"
+            );
+            return Ok(report);
+        };
         let transcript = render_transcript(span, self.config.max_transcript_chars);
         if transcript.is_empty() {
-            return Ok(());
+            return Ok(report);
         }
 
         // Show the scope's memories most relevant to this span so the model
@@ -343,14 +434,16 @@ impl MemoryDistiller {
              TRANSCRIPT:\n{transcript}"
         );
 
-        let reply = ctx.model().complete(&[Message::user(prompt)], &[]).await?;
+        let reply = model.complete(&[Message::user(prompt)], &[]).await?;
         let reply_text = reply.text_content();
         let Some(json_slice) = extract_json_array(&reply_text) else {
-            return Err(format!("distill reply contained no JSON array: {reply_text:.120}").into());
+            return Err(DistillError::Parse(format!(
+                "no JSON array in: {reply_text:.120}"
+            )));
         };
-        let items: Vec<DistillItem> = serde_json::from_str(json_slice)?;
+        let items: Vec<DistillItem> =
+            serde_json::from_str(json_slice).map_err(|e| DistillError::Parse(e.to_string()))?;
 
-        let session_id = ctx.session().id().to_string();
         for item in items {
             match item.id {
                 Some(id) => {
@@ -364,10 +457,9 @@ impl MemoryDistiller {
                     // ids from other scopes into the model's context).
                     match self.store.get(&id).await {
                         Ok(Some(record)) if record.scope == self.scope => {
-                            if let Err(err) =
-                                self.store.update(&id, Some(&item.content), None).await
-                            {
-                                tracing::warn!("distill update skipped: {err}");
+                            match self.store.update(&id, Some(&item.content), None).await {
+                                Ok(_) => report.updated += 1,
+                                Err(err) => tracing::warn!("distill update skipped: {err}"),
                             }
                         }
                         Ok(_) => {
@@ -381,18 +473,26 @@ impl MemoryDistiller {
                         tracing::debug!("distill skipped near-duplicate: {}", item.content);
                         continue;
                     }
-                    self.store
+                    // Best-effort, symmetric with the update path above: a
+                    // failed write is logged and skipped, never aborting the
+                    // pass and discarding the records that already landed.
+                    match self
+                        .store
                         .save(
                             self.scope.clone(),
                             &item.content,
                             &item.tags,
-                            Some(&session_id),
+                            Some(source_session),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(record) => report.saved.push(record),
+                        Err(err) => tracing::warn!("distill save skipped: {err}"),
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(report)
     }
 
     /// Backend-independent near-duplicate gate: Jaccard token overlap with
@@ -505,7 +605,7 @@ mod tests {
     use super::*;
     use crate::agent::Agent;
     use crate::test_util::MockModel;
-    use sweet_core::EphemeralMemory;
+    use sweet_core::{EphemeralMemory, MemoryHit, MemoryId};
 
     fn scope() -> MemoryScope {
         MemoryScope::User("u1".into())
@@ -713,6 +813,186 @@ mod tests {
         // would error on MockModel's empty script if it called the model).
         distiller.run_now(&mut agent).await;
         assert_eq!(store.search(&MemoryQuery::new()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn distill_span_runs_detached_and_reports_writes() {
+        let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
+        let stale = store
+            .save(scope(), "user deploys on Fridays", &[], None)
+            .await
+            .unwrap();
+        let reply = format!(
+            r#"[{{"id": "{}", "content": "user deploys on Mondays now"}},
+                {{"content": "project uses pnpm", "tags": ["tooling"]}}]"#,
+            stale.id
+        );
+        let model = MockModel::with_replies([reply]);
+        let distiller = MemoryDistiller::new(store.clone(), scope(), DistillConfig::default());
+
+        // No CommandContext anywhere: a claim plus a snapshot is all it needs.
+        let span = vec![MemoryItem::Message(Message::user(
+            "we moved deploys to Monday and switched to pnpm",
+        ))];
+        let claim = distiller.claim_span(span.len(), 1).expect("span claimed");
+        let report = distiller
+            .distill_span(&model, claim, &span, "s1")
+            .await
+            .unwrap();
+
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.saved.len(), 1);
+        assert_eq!(report.saved[0].content, "project uses pnpm");
+        assert_eq!(report.saved[0].source_session.as_deref(), Some("s1"));
+        let record = store.get(&stale.id).await.unwrap().unwrap();
+        assert_eq!(record.content, "user deploys on Mondays now");
+    }
+
+    #[tokio::test]
+    async fn distill_span_surfaces_typed_parse_errors() {
+        let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
+        let model = MockModel::with_replies(["I have nothing structured to say"]);
+        let distiller = MemoryDistiller::new(store, scope(), DistillConfig::default());
+
+        let span = vec![MemoryItem::Message(Message::user("hello"))];
+        let claim = distiller.claim_span(span.len(), 1).expect("span claimed");
+        let err = distiller
+            .distill_span(&model, claim, &span, "s1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DistillError::Parse(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn distill_span_surfaces_model_errors() {
+        let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
+        // An empty script makes the model's `complete` return an error,
+        // which propagates as DistillError::Model.
+        let model = MockModel::with_replies(Vec::<&str>::new());
+        let distiller = MemoryDistiller::new(store, scope(), DistillConfig::default());
+
+        let span = vec![MemoryItem::Message(Message::user("hello"))];
+        let claim = distiller.claim_span(span.len(), 1).expect("span claimed");
+        let err = distiller
+            .distill_span(&model, claim, &span, "s1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DistillError::Model(_)), "got: {err:?}");
+    }
+
+    /// Delegates everything to an inner `EphemeralMemory` but fails every
+    /// `save`, to exercise the best-effort write path.
+    struct FailingSaves(EphemeralMemory);
+
+    #[async_trait::async_trait]
+    impl Memory for FailingSaves {
+        async fn save(
+            &self,
+            _scope: MemoryScope,
+            _content: &str,
+            _tags: &[String],
+            _source_session: Option<&str>,
+        ) -> std::result::Result<MemoryRecord, MemoryError> {
+            Err(MemoryError::storage(std::io::Error::other(
+                "saves disabled",
+            )))
+        }
+        async fn get(
+            &self,
+            id: &MemoryId,
+        ) -> std::result::Result<Option<MemoryRecord>, MemoryError> {
+            self.0.get(id).await
+        }
+        async fn search(
+            &self,
+            query: &MemoryQuery,
+        ) -> std::result::Result<Vec<MemoryHit>, MemoryError> {
+            self.0.search(query).await
+        }
+        async fn update(
+            &self,
+            id: &MemoryId,
+            content: Option<&str>,
+            tags: Option<&[String]>,
+        ) -> std::result::Result<MemoryRecord, MemoryError> {
+            self.0.update(id, content, tags).await
+        }
+        async fn delete(&self, id: &MemoryId) -> std::result::Result<bool, MemoryError> {
+            self.0.delete(id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn distill_span_skips_failed_saves_and_reports_the_rest() {
+        let inner = EphemeralMemory::new();
+        let stale = inner
+            .save(scope(), "user deploys on Fridays", &[], None)
+            .await
+            .unwrap();
+        let store: Arc<dyn Memory> = Arc::new(FailingSaves(inner));
+
+        let reply = format!(
+            r#"[{{"id": "{}", "content": "user deploys on Mondays now"}},
+                {{"content": "project uses pnpm"}}]"#,
+            stale.id
+        );
+        let model = MockModel::with_replies([reply]);
+        let distiller = MemoryDistiller::new(store.clone(), scope(), DistillConfig::default());
+
+        // A failing save must not abort the pass: the update still lands and
+        // the call returns Ok, with the failed save simply absent from saved.
+        let span = vec![MemoryItem::Message(Message::user("we switched to pnpm"))];
+        let claim = distiller.claim_span(span.len(), 1).expect("span claimed");
+        let report = distiller
+            .distill_span(&model, claim, &span, "s1")
+            .await
+            .unwrap();
+
+        assert_eq!(report.updated, 1);
+        assert!(report.saved.is_empty());
+        let record = store.get(&stale.id).await.unwrap().unwrap();
+        assert_eq!(record.content, "user deploys on Mondays now");
+    }
+
+    #[tokio::test]
+    async fn distill_span_skips_when_items_shorter_than_claim() {
+        let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
+        // Empty script: were the model called, this would error — so reaching
+        // Ok proves the guard returns before the model call.
+        let model = MockModel::with_replies(Vec::<&str>::new());
+        let distiller = MemoryDistiller::new(store, scope(), DistillConfig::default());
+
+        // Advance the watermark so the next claim starts at 5...
+        let _ = distiller.claim_span(5, 1).expect("first claim");
+        let claim = distiller.claim_span(10, 1).expect("second claim");
+        // ...then hand distill a snapshot too short to contain that start.
+        let short = vec![MemoryItem::Message(Message::user("a"))];
+        let report = distiller
+            .distill_span(&model, claim, &short, "s1")
+            .await
+            .unwrap();
+
+        assert!(report.saved.is_empty());
+        assert_eq!(report.updated, 0);
+    }
+
+    #[test]
+    fn claim_span_yields_each_span_exactly_once() {
+        let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
+        let distiller = MemoryDistiller::new(store, scope(), DistillConfig::default());
+
+        assert!(matches!(
+            distiller.claim_span(5, 1),
+            Some(SpanClaim { start: 0 })
+        ));
+        // Claimed before the (possibly backgrounded) distill runs: a second
+        // caller at the same length gets nothing.
+        assert!(distiller.claim_span(5, 1).is_none());
+        // Growth yields only the new tail.
+        assert!(matches!(
+            distiller.claim_span(8, 1),
+            Some(SpanClaim { start: 5 })
+        ));
     }
 
     #[test]

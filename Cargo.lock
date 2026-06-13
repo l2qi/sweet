@@ -1954,6 +1954,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sweet-core",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
