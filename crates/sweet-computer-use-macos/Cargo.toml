@@ -1,0 +1,21 @@
+[package]
+name = "sweet-computer-use-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "macOS computer-use backend (accessibility tree, Quartz input events, screen capture) implementing the sweet-computer-use-core provider trait."
+
+[dependencies]
+sweet-computer-use-core = { path = "../sweet-computer-use-core" }
+async-trait = { workspace = true }
+
+# Screen capture downscaling (resizing the pixel capture to the display's point
+# size) is macOS-only; other targets build the Unsupported stub and need none of
+# this.
+[target.'cfg(target_os = "macos")'.dependencies]
+image = { workspace = true }
+
+[dev-dependencies]
+# For the `probe` example, which drives the backend directly.
+tokio = { workspace = true, features = ["macros", "rt"] }

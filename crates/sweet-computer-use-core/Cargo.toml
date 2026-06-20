@@ -1,0 +1,17 @@
+[package]
+name = "sweet-computer-use-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Platform-neutral computer-use substrate (actions, observations, provider trait, and the agent tool) for sweet-based agents."
+
+[dependencies]
+sweet-core = { path = "../sweet-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

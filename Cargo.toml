@@ -10,6 +10,8 @@ members = [
     "crates/sweet-sandbox",
     "crates/sweet-mcp",
     "crates/sweet-mcp-mock-server",
+    "crates/sweet-computer-use-core",
+    "crates/sweet-computer-use-macos",
 ]
 resolver = "2"
 
@@ -50,3 +52,4 @@ dunce = "1"
 which = "7"
 base64 = "0.22"
 dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
