@@ -26,7 +26,7 @@ pub use memory::{
     cosine_similarity, rrf_merge, unix_now, EphemeralMemory, Memory, MemoryError, MemoryHit,
     MemoryId, MemoryQuery, MemoryRecord, MemoryScope, DEFAULT_QUERY_LIMIT,
 };
-pub use message::{ContentBlock, Message, Role, ThinkingContent, ToolCall};
+pub use message::{ContentBlock, FinishReason, Message, Role, ThinkingContent, ToolCall};
 pub use model::Model;
 pub use permission::{
     approval_scope, ApprovalDecision, ApprovalPreview, PermissionMode, PermissionState, ToolRisk,
@@ -40,7 +40,7 @@ pub use session::{
     SharedSession, SharedSessionHandle,
 };
 pub use stream::{NoopSink, StreamSink};
-pub use tool::{execution_error, ToolError, ToolFn, ToolHandler, ToolSpec};
+pub use tool::{execution_error, ToolError, ToolFn, ToolHandler, ToolOutput, ToolSpec};
 pub use version::SWEET_VERSION;
 
 pub use async_trait::async_trait;

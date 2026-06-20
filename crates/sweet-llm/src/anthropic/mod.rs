@@ -11,15 +11,14 @@ use sweet_core::stream::StreamSink;
 use sweet_core::{Message, Model, Result, ToolSpec, SWEET_VERSION};
 
 use crate::error::ProviderError;
+use crate::schema::sanitize_schema;
 use crate::util::{elapsed_ms, provider_error_from_core};
-
-mod thinking;
-pub use thinking::ThinkingConfig;
+use crate::{ReasoningConfig, SamplingConfig, StructuredOutput, ToolChoice};
 
 mod wire;
 use wire::{
     convert_messages, message_from_content_blocks, parse_response, ContentBlock, MessagesRequest,
-    MessagesResponse, StreamDelta, StreamEvent, WireThinking, WireTool,
+    MessagesResponse, OutputConfig, StreamDelta, StreamEvent, WireThinking, WireTool,
 };
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -27,6 +26,11 @@ pub const DEFAULT_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 pub const DEFAULT_MAX_TOKENS: usize = 4096;
 pub const API_VERSION: &str = "2023-06-01";
+/// Anthropic requires extended-thinking budgets of at least 1024 tokens.
+const MIN_THINKING_BUDGET: usize = 1024;
+/// Budget used when enabling thinking on a pre-4.6 model via the toggle dialect
+/// (those models need an explicit `budget_tokens`, not `{type: adaptive}`).
+const DEFAULT_THINKING_BUDGET: usize = 2048;
 
 /// Inference provider for Anthropic's native `/v1/messages` API.
 #[derive(Debug, Clone)]
@@ -37,7 +41,35 @@ pub struct AnthropicProvider {
     model: String,
     max_tokens: usize,
     user_agent: String,
-    thinking: Option<ThinkingConfig>,
+    reasoning: Option<AnthropicReasoning>,
+    sampling: SamplingConfig,
+    prompt_caching: bool,
+    tool_choice: Option<ToolChoice>,
+    structured_output: Option<StructuredOutput>,
+    auth_token: Option<String>,
+    extra_betas: Vec<String>,
+}
+
+/// How reasoning was configured for an [`AnthropicProvider`], translated to the
+/// wire `thinking` object and/or top-level `effort` field at request time.
+#[derive(Debug, Clone)]
+enum AnthropicReasoning {
+    /// `thinking: {type: adaptive}` (Sonnet 4.6 / Opus 4.6+).
+    Adaptive,
+    /// `thinking: {type: enabled, budget_tokens: n}`.
+    Budget(u32),
+    /// Top-level `effort` (e.g. `low`/`medium`/`high`); no `thinking` object.
+    Effort(String),
+    /// `thinking: {type: disabled}`.
+    Off,
+}
+
+/// Resolved sampling fields for one request (after Anthropic's clamps).
+struct SamplingFields<'a> {
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    stop_sequences: Option<&'a [String]>,
 }
 
 impl AnthropicProvider {
@@ -49,8 +81,94 @@ impl AnthropicProvider {
             model: DEFAULT_MODEL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
             user_agent: format!("sweet/{}", SWEET_VERSION),
-            thinking: None,
+            reasoning: None,
+            sampling: SamplingConfig::default(),
+            prompt_caching: true,
+            tool_choice: None,
+            structured_output: None,
+            auth_token: None,
+            extra_betas: Vec::new(),
         }
+    }
+
+    /// Authenticate with `Authorization: Bearer <token>` (e.g. an OAuth access
+    /// token) instead of `x-api-key`. Takes precedence over the API key.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Add an `anthropic-beta` header value sent with every request.
+    pub fn with_beta(mut self, beta: impl Into<String>) -> Self {
+        self.extra_betas.push(beta.into());
+        self
+    }
+
+    /// Constrain how the model chooses among tools. Only sent when the request
+    /// carries tools.
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+
+    /// Constrain the response to JSON matching a schema via native
+    /// `output_config.format` (adds the `structured-outputs` beta header).
+    pub fn with_structured_output(mut self, output: StructuredOutput) -> Self {
+        self.structured_output = Some(output);
+        self
+    }
+
+    /// The `tool_choice` wire value, or `None` when unset or no tools present.
+    fn tool_choice_value(&self, has_tools: bool) -> Option<Value> {
+        if !has_tools {
+            return None;
+        }
+        Some(match self.tool_choice.as_ref()? {
+            ToolChoice::Auto => serde_json::json!({ "type": "auto" }),
+            ToolChoice::None => serde_json::json!({ "type": "none" }),
+            ToolChoice::Required => serde_json::json!({ "type": "any" }),
+            ToolChoice::Tool(name) => serde_json::json!({ "type": "tool", "name": name }),
+        })
+    }
+
+    /// `anthropic-beta` header values to send for this request: any explicitly
+    /// added betas, the structured-output beta when structured output is
+    /// requested, and the PDF beta when the prompt carries a file attachment.
+    fn betas(&self, messages: &[Message]) -> Vec<String> {
+        let mut betas = self.extra_betas.clone();
+        if self.structured_output.is_some() {
+            betas.push("structured-outputs-2025-11-13".to_string());
+        }
+        if messages.iter().any(|m| m.has_files()) {
+            betas.push("pdfs-2024-09-25".to_string());
+        }
+        betas
+    }
+
+    /// Enable or disable automatic prompt caching (on by default). When on, the
+    /// provider inserts `cache_control` breakpoints on the tools, system prompt,
+    /// and last message so Anthropic caches the stable prefix across turns.
+    pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
+        self.prompt_caching = enabled;
+        self
+    }
+
+    /// Set cross-provider sampling parameters. `frequency_penalty`,
+    /// `presence_penalty`, and `seed` are unsupported by Anthropic and dropped
+    /// with a warning; `temperature`/`top_p`/`top_k` are additionally suppressed
+    /// when extended thinking is on (the API rejects them together).
+    pub fn with_sampling(mut self, sampling: SamplingConfig) -> Self {
+        if sampling.frequency_penalty.is_some()
+            || sampling.presence_penalty.is_some()
+            || sampling.seed.is_some()
+        {
+            tracing::warn!(
+                target: "sweet_llm::anthropic",
+                "frequency_penalty/presence_penalty/seed are unsupported by Anthropic; ignoring"
+            );
+        }
+        self.sampling = sampling;
+        self
     }
 
     pub fn from_env() -> Result<Self> {
@@ -90,8 +208,19 @@ impl AnthropicProvider {
         self
     }
 
-    pub fn with_thinking(mut self, config: ThinkingConfig) -> Self {
-        self.thinking = Some(config);
+    /// Configure reasoning for this provider.
+    ///
+    /// - [`Toggle(true)`](ReasoningConfig::Toggle) -> `thinking: {type: adaptive}`.
+    /// - [`Toggle(false)`](ReasoningConfig::Toggle) -> `thinking: {type: disabled}`.
+    /// - [`Budget(n)`](ReasoningConfig::Budget) -> `thinking: {type: enabled, budget_tokens: n}`.
+    /// - [`Effort(e)`](ReasoningConfig::Effort) -> `output_config: {effort: e}` (no `thinking` object).
+    pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
+        self.reasoning = Some(match config {
+            ReasoningConfig::Toggle(true) => AnthropicReasoning::Adaptive,
+            ReasoningConfig::Toggle(false) => AnthropicReasoning::Off,
+            ReasoningConfig::Budget(n) => AnthropicReasoning::Budget(n),
+            ReasoningConfig::Effort(e) => AnthropicReasoning::Effort(e),
+        });
         self
     }
 
@@ -108,12 +237,113 @@ impl AnthropicProvider {
     }
 
     fn wire_thinking(&self) -> Option<WireThinking> {
-        self.thinking.as_ref().map(|t| match t {
-            ThinkingConfig::Enabled { budget_tokens } => WireThinking::Enabled {
-                budget_tokens: *budget_tokens,
-            },
-            ThinkingConfig::Adaptive => WireThinking::Adaptive,
+        let reasoning = self.reasoning.as_ref()?;
+        let adaptive = supports_adaptive_thinking(&self.model);
+        Some(match reasoning {
+            AnthropicReasoning::Off => WireThinking::Disabled,
+            // The effort dialect rides on `output_config`, not `thinking`.
+            AnthropicReasoning::Effort(_) => return None,
+            // Toggle-on: adaptive on 4.6+, an explicit budget on older models
+            // (which don't accept `{type: adaptive}`).
+            AnthropicReasoning::Adaptive => {
+                if adaptive {
+                    WireThinking::Adaptive
+                } else {
+                    WireThinking::Enabled {
+                        budget_tokens: self.thinking_budget(),
+                    }
+                }
+            }
+            // A concrete budget is honored on models that accept it; newer
+            // models (opus 4.7/4.8, fable) 400 on `budget_tokens`, so they fall
+            // back to adaptive thinking instead.
+            AnthropicReasoning::Budget(_) => {
+                if rejects_budget_tokens(&self.model) {
+                    WireThinking::Adaptive
+                } else {
+                    WireThinking::Enabled {
+                        budget_tokens: self.thinking_budget(),
+                    }
+                }
+            }
         })
+    }
+
+    /// The `output_config` block: the reasoning `effort` level (effort dialect)
+    /// and/or the structured-output `format` schema. `None` when neither is set.
+    fn wire_output_config(&self) -> Option<OutputConfig<'_>> {
+        let effort = match self.reasoning.as_ref() {
+            Some(AnthropicReasoning::Effort(e)) => Some(e.as_str()),
+            _ => None,
+        };
+        let format = self.structured_output.as_ref().map(|so| {
+            let mut schema = so.schema.clone();
+            sanitize_schema(&mut schema);
+            serde_json::json!({ "type": "json_schema", "schema": schema })
+        });
+        if effort.is_none() && format.is_none() {
+            return None;
+        }
+        Some(OutputConfig { effort, format })
+    }
+
+    /// The thinking-token budget to send, clamped up to Anthropic's 1024-token
+    /// minimum. `0` unless reasoning is the budget dialect.
+    ///
+    /// Anthropic draws thinking *from* `max_tokens` and requires
+    /// `budget_tokens < max_tokens`. Since `max_tokens` is set to the model's
+    /// full output ceiling (models.dev `limit.output`), "add budget then clamp
+    /// to the ceiling" reduces to "use the ceiling" - so `max_tokens` is sent
+    /// unchanged and the budget is carved out of it.
+    fn thinking_budget(&self) -> usize {
+        let requested = match self.reasoning.as_ref() {
+            Some(AnthropicReasoning::Budget(n)) => *n as usize,
+            // Pre-4.6 toggle-on needs an explicit budget; use a sane default.
+            Some(AnthropicReasoning::Adaptive) => DEFAULT_THINKING_BUDGET,
+            _ => return 0,
+        };
+        // Anthropic requires `1024 <= budget_tokens < max_tokens`; `max_tokens`
+        // is the model's output ceiling, so clamp the budget strictly below it.
+        let upper = self.max_tokens.saturating_sub(1);
+        requested.clamp(MIN_THINKING_BUDGET.min(upper), upper)
+    }
+
+    /// The output cap to send: an explicit sampling override, else the model
+    /// ceiling configured via [`with_max_tokens`](Self::with_max_tokens).
+    fn request_max_tokens(&self) -> usize {
+        self.sampling.max_tokens.unwrap_or(self.max_tokens)
+    }
+
+    /// Sampling fields for the request, applying Anthropic's constraints:
+    /// `temperature`/`top_p`/`top_k` are dropped while thinking is on, and
+    /// `temperature` and `top_p` are mutually exclusive.
+    fn sampling_fields(&self) -> SamplingFields<'_> {
+        let stop_sequences =
+            (!self.sampling.stop.is_empty()).then_some(self.sampling.stop.as_slice());
+        let thinking_on = matches!(
+            self.wire_thinking(),
+            Some(WireThinking::Adaptive | WireThinking::Enabled { .. })
+        );
+        if thinking_on {
+            return SamplingFields {
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences,
+            };
+        }
+        let temperature = self.sampling.temperature;
+        let top_p = if temperature.is_some() {
+            None
+        } else {
+            self.sampling.top_p
+        };
+        SamplingFields {
+            temperature,
+            top_p,
+            top_k: self.sampling.top_k,
+            stop_sequences,
+        }
     }
 
     async fn complete_inner(
@@ -138,15 +368,32 @@ impl AnthropicProvider {
             )
         };
 
+        let SamplingFields {
+            temperature,
+            top_p,
+            top_k,
+            stop_sequences,
+        } = self.sampling_fields();
         let body = MessagesRequest {
             model: &self.model,
-            max_tokens: self.max_tokens,
+            max_tokens: self.request_max_tokens(),
             system,
             messages: anthropic_messages,
             tools: tools_wire,
             stream: false,
             thinking: self.wire_thinking(),
+            output_config: self.wire_output_config(),
+            temperature,
+            top_p,
+            top_k,
+            stop_sequences,
+            tool_choice: self.tool_choice_value(!tools.is_empty()),
         };
+        let mut body_value = serde_json::to_value(&body)?;
+        crate::sampling::merge_extra(&mut body_value, &self.sampling.extra);
+        if self.prompt_caching {
+            wire::apply_prompt_caching(&mut body_value);
+        }
 
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
 
@@ -157,8 +404,14 @@ impl AnthropicProvider {
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
             .header("User-Agent", &self.user_agent)
-            .json(&body);
-        if !self.api_key.is_empty() {
+            .json(&body_value);
+        let betas = self.betas(messages);
+        if !betas.is_empty() {
+            req = req.header("anthropic-beta", betas.join(","));
+        }
+        if let Some(token) = &self.auth_token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        } else if !self.api_key.is_empty() {
             req = req.header("x-api-key", &self.api_key);
         }
         let resp = req.send().await?;
@@ -211,15 +464,32 @@ impl AnthropicProvider {
             )
         };
 
+        let SamplingFields {
+            temperature,
+            top_p,
+            top_k,
+            stop_sequences,
+        } = self.sampling_fields();
         let body = MessagesRequest {
             model: &self.model,
-            max_tokens: self.max_tokens,
+            max_tokens: self.request_max_tokens(),
             system,
             messages: anthropic_messages,
             tools: tools_wire,
             stream: true,
             thinking: self.wire_thinking(),
+            output_config: self.wire_output_config(),
+            temperature,
+            top_p,
+            top_k,
+            stop_sequences,
+            tool_choice: self.tool_choice_value(!tools.is_empty()),
         };
+        let mut body_value = serde_json::to_value(&body)?;
+        crate::sampling::merge_extra(&mut body_value, &self.sampling.extra);
+        if self.prompt_caching {
+            wire::apply_prompt_caching(&mut body_value);
+        }
 
         let url = format!("{}/messages", self.base_url.trim_end_matches('/'));
 
@@ -230,8 +500,14 @@ impl AnthropicProvider {
             .header("anthropic-version", API_VERSION)
             .header("content-type", "application/json")
             .header("User-Agent", &self.user_agent)
-            .json(&body);
-        if !self.api_key.is_empty() {
+            .json(&body_value);
+        let betas = self.betas(messages);
+        if !betas.is_empty() {
+            req = req.header("anthropic-beta", betas.join(","));
+        }
+        if let Some(token) = &self.auth_token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        } else if !self.api_key.is_empty() {
             req = req.header("x-api-key", &self.api_key);
         }
         let resp = req.send().await?;
@@ -251,6 +527,7 @@ impl AnthropicProvider {
         let mut block_states: Vec<BlockState> = Vec::new();
         let mut input_tokens: Option<usize> = None;
         let mut output_tokens: Option<usize> = None;
+        let mut stop_reason: Option<String> = None;
         let mut done = false;
 
         while let Some(chunk) = stream.next().await {
@@ -368,7 +645,10 @@ impl AnthropicProvider {
                             BlockState::Unknown => {}
                         }
                     }
-                    StreamEvent::MessageDelta { usage, .. } => {
+                    StreamEvent::MessageDelta { delta, usage } => {
+                        if let Some(sr) = delta.and_then(|d| d.stop_reason) {
+                            stop_reason = Some(sr);
+                        }
                         if let Some(usage) = usage {
                             output_tokens = usage.output_tokens;
                         }
@@ -431,9 +711,12 @@ impl AnthropicProvider {
             .map(|(input, output)| wire::Usage {
                 input_tokens: Some(input),
                 output_tokens: Some(output),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             });
 
-        let reply = message_from_content_blocks(final_blocks, usage)?;
+        let mut reply = message_from_content_blocks(final_blocks, usage)?;
+        reply.finish_reason = stop_reason.as_deref().map(wire::map_stop_reason);
 
         tracing::debug!(
             target: "sweet_llm::observability",
@@ -482,6 +765,28 @@ enum BlockState {
     Unknown,
 }
 
+/// Whether `model` accepts `thinking: {type: adaptive}` (Claude 4.6 and newer).
+fn supports_adaptive_thinking(model: &str) -> bool {
+    [
+        "opus-4-6",
+        "opus-4-7",
+        "opus-4-8",
+        "sonnet-4-6",
+        "fable",
+        "mythos",
+    ]
+    .iter()
+    .any(|m| model.contains(m))
+}
+
+/// Whether `model` rejects `thinking.budget_tokens` with a 400 (opus 4.7/4.8 and
+/// fable/mythos). These take adaptive thinking instead of an explicit budget.
+fn rejects_budget_tokens(model: &str) -> bool {
+    ["opus-4-7", "opus-4-8", "fable", "mythos"]
+        .iter()
+        .any(|m| model.contains(m))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +807,220 @@ mod tests {
     fn prepend_user_agent_prepends_with_space() {
         let p = AnthropicProvider::new("k").prepend_user_agent("app/1.0");
         assert_eq!(p.user_agent, format!("app/1.0 sweet/{}", SWEET_VERSION));
+    }
+
+    #[test]
+    fn toggle_on_uses_adaptive_thinking_on_46_models() {
+        let p = AnthropicProvider::new("k")
+            .with_model("claude-opus-4-8")
+            .with_reasoning(ReasoningConfig::Toggle(true));
+        assert!(matches!(p.wire_thinking(), Some(WireThinking::Adaptive)));
+        assert!(p.wire_output_config().is_none());
+    }
+
+    #[test]
+    fn toggle_on_pre_46_model_uses_enabled_budget() {
+        // Sonnet 4 (pre-4.6) doesn't accept `{type: adaptive}`; toggle-on must
+        // send an explicit budget instead.
+        let p = AnthropicProvider::new("k")
+            .with_model("claude-sonnet-4-20250514")
+            .with_reasoning(ReasoningConfig::Toggle(true));
+        assert!(matches!(
+            p.wire_thinking(),
+            Some(WireThinking::Enabled { .. })
+        ));
+    }
+
+    #[test]
+    fn toggle_off_disables_thinking() {
+        let p = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Toggle(false));
+        assert!(matches!(p.wire_thinking(), Some(WireThinking::Disabled)));
+        assert!(p.wire_output_config().is_none());
+    }
+
+    #[test]
+    fn budget_enables_thinking_with_budget_tokens() {
+        let p = AnthropicProvider::new("k")
+            .with_max_tokens(64_000)
+            .with_reasoning(ReasoningConfig::Budget(4096));
+        assert!(matches!(
+            p.wire_thinking(),
+            Some(WireThinking::Enabled {
+                budget_tokens: 4096
+            })
+        ));
+        assert!(p.wire_output_config().is_none());
+    }
+
+    #[test]
+    fn effort_sets_output_config_not_thinking() {
+        let p = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Effort("high".into()));
+        assert_eq!(p.wire_output_config().and_then(|o| o.effort), Some("high"));
+        assert!(p.wire_thinking().is_none());
+    }
+
+    #[test]
+    fn no_reasoning_by_default() {
+        let p = AnthropicProvider::new("k");
+        assert!(p.wire_thinking().is_none());
+        assert!(p.wire_output_config().is_none());
+    }
+
+    #[test]
+    fn budget_below_minimum_is_clamped() {
+        let p = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Budget(500));
+        assert!(matches!(
+            p.wire_thinking(),
+            Some(WireThinking::Enabled {
+                budget_tokens: MIN_THINKING_BUDGET
+            })
+        ));
+    }
+
+    #[test]
+    fn with_max_tokens_sets_output_ceiling() {
+        // `max_tokens` is the model's output ceiling (from the catalog); the
+        // thinking budget is carved out of it, not added on top.
+        let p = AnthropicProvider::new("k")
+            .with_max_tokens(64_000)
+            .with_reasoning(ReasoningConfig::Budget(8_000));
+        assert_eq!(p.max_tokens(), 64_000);
+        assert_eq!(p.thinking_budget(), 8_000);
+        assert!(p.thinking_budget() < p.max_tokens());
+    }
+
+    #[test]
+    fn budget_on_rejecting_model_falls_back_to_adaptive() {
+        // opus-4-8 returns a 400 on `budget_tokens`; send adaptive instead.
+        let p = AnthropicProvider::new("k")
+            .with_model("claude-opus-4-8")
+            .with_max_tokens(64_000)
+            .with_reasoning(ReasoningConfig::Budget(8_000));
+        assert!(matches!(p.wire_thinking(), Some(WireThinking::Adaptive)));
+    }
+
+    #[test]
+    fn budget_is_clamped_below_max_tokens() {
+        // Default max_tokens is 4096; an over-large budget clamps to < max_tokens.
+        let p = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Budget(50_000));
+        assert!(p.thinking_budget() < p.max_tokens());
+        assert_eq!(p.thinking_budget(), p.max_tokens() - 1);
+    }
+
+    #[test]
+    fn stop_reason_maps_refusal_and_length() {
+        use super::wire::map_stop_reason;
+        use sweet_core::FinishReason;
+        assert_eq!(map_stop_reason("end_turn"), FinishReason::Stop);
+        assert_eq!(map_stop_reason("max_tokens"), FinishReason::Length);
+        assert_eq!(map_stop_reason("tool_use"), FinishReason::ToolCalls);
+        assert_eq!(map_stop_reason("refusal"), FinishReason::Refusal);
+        assert_eq!(
+            map_stop_reason("???"),
+            FinishReason::Other("???".to_string())
+        );
+    }
+
+    #[test]
+    fn sampling_dropped_when_thinking_on() {
+        let p = AnthropicProvider::new("k")
+            .with_model("claude-opus-4-8")
+            .with_reasoning(ReasoningConfig::Toggle(true))
+            .with_sampling(SamplingConfig {
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                top_k: Some(40),
+                ..Default::default()
+            });
+        let SamplingFields {
+            temperature: t,
+            top_p,
+            top_k,
+            ..
+        } = p.sampling_fields();
+        assert!(t.is_none() && top_p.is_none() && top_k.is_none());
+    }
+
+    #[test]
+    fn temperature_and_top_p_mutually_exclusive() {
+        let p = AnthropicProvider::new("k").with_sampling(SamplingConfig {
+            temperature: Some(0.7),
+            top_p: Some(0.9),
+            ..Default::default()
+        });
+        let SamplingFields {
+            temperature: t,
+            top_p,
+            ..
+        } = p.sampling_fields();
+        assert_eq!(t, Some(0.7));
+        assert!(top_p.is_none());
+    }
+
+    #[test]
+    fn sampling_max_tokens_overrides_ceiling() {
+        let p = AnthropicProvider::new("k")
+            .with_max_tokens(64_000)
+            .with_sampling(SamplingConfig {
+                max_tokens: Some(1000),
+                ..Default::default()
+            });
+        assert_eq!(p.request_max_tokens(), 1000);
+    }
+
+    #[test]
+    fn tool_choice_maps_to_anthropic_wire() {
+        let p = AnthropicProvider::new("k").with_tool_choice(ToolChoice::Required);
+        assert_eq!(
+            p.tool_choice_value(true),
+            Some(serde_json::json!({ "type": "any" }))
+        );
+        assert!(p.tool_choice_value(false).is_none());
+
+        let p = AnthropicProvider::new("k").with_tool_choice(ToolChoice::Tool("x".into()));
+        assert_eq!(
+            p.tool_choice_value(true),
+            Some(serde_json::json!({ "type": "tool", "name": "x" }))
+        );
+    }
+
+    #[test]
+    fn structured_output_sets_output_config_format_and_beta() {
+        let p = AnthropicProvider::new("k").with_structured_output(StructuredOutput::new(
+            serde_json::json!({ "type": "object" }),
+        ));
+        let oc = p.wire_output_config().expect("output_config present");
+        let format = oc.format.expect("format present");
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["schema"]["type"], "object");
+        assert_eq!(
+            p.betas(&[]),
+            vec!["structured-outputs-2025-11-13".to_string()]
+        );
+    }
+
+    #[test]
+    fn betas_include_custom_and_pdf() {
+        let p = AnthropicProvider::new("k").with_beta("custom-beta");
+        // No attachments: just the custom beta.
+        assert_eq!(
+            p.betas(&[Message::user("hi")]),
+            vec!["custom-beta".to_string()]
+        );
+        // A file attachment adds the PDF beta.
+        let with_file = Message::user_blocks(vec![sweet_core::ContentBlock::File {
+            data: vec![1, 2, 3],
+            media_type: "application/pdf".into(),
+            filename: "d.pdf".into(),
+        }]);
+        let betas = p.betas(std::slice::from_ref(&with_file));
+        assert!(betas.contains(&"custom-beta".to_string()));
+        assert!(betas.contains(&"pdfs-2024-09-25".to_string()));
+    }
+
+    #[test]
+    fn auth_token_takes_precedence_over_api_key() {
+        let p = AnthropicProvider::new("api-key").with_auth_token("bearer-tok");
+        assert_eq!(p.auth_token.as_deref(), Some("bearer-tok"));
     }
 }

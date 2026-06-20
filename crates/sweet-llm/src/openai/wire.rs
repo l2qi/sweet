@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sweet_core::{Message, Role, ToolCall};
 
+use sweet_core::FinishReason;
+
 use super::reasoning::ReasoningContent;
 use crate::error::ProviderError;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 pub(crate) struct ChatRequest<'a> {
     pub model: &'a str,
     pub messages: Vec<WireMessage<'a>>,
@@ -25,6 +27,24 @@ pub(crate) struct ChatRequest<'a> {
     pub reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,6 +52,8 @@ pub(crate) struct ThinkingConfig {
     pub r#type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +109,11 @@ pub(crate) struct WireMessage<'a> {
     pub content: Option<WireContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<&'a str>,
+    /// Alternate reasoning-history field. Cerebras expects replayed assistant
+    /// reasoning under `reasoning` rather than `reasoning_content`; exactly one
+    /// of the two is ever populated (see [`super::ReasoningHistoryKey`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tool_calls: Vec<WireToolCall<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,22 +155,43 @@ impl<'a> WireMessage<'a> {
     /// is echoed on the wire. Plain OpenAI servers do not understand the
     /// field and some strict proxies reject unknown `messages[]` keys, so
     /// callers should only set this when targeting a thinking-aware backend.
+    /// Test-only convenience defaulting to the `reasoning_content` history key;
+    /// production always goes through [`WireMessage::new_with_key`].
+    #[cfg(test)]
     pub(crate) fn new(m: &'a Message, include_reasoning: bool) -> Self {
+        Self::new_with_key(
+            m,
+            include_reasoning,
+            super::ReasoningHistoryKey::ReasoningContent,
+        )
+    }
+
+    /// As [`WireMessage::new`], but selecting which wire field carries replayed
+    /// assistant reasoning (`reasoning_content` vs Cerebras's `reasoning`).
+    pub(crate) fn new_with_key(
+        m: &'a Message,
+        include_reasoning: bool,
+        reasoning_key: super::ReasoningHistoryKey,
+    ) -> Self {
         let role = match m.role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         };
-        let reasoning_content = match m.reasoning_content() {
-            // Always echo reasoning_content back when the model provided
-            // it, even if the provider wasn't explicitly configured for
-            // thinking (DeepSeek/Kimi auto-enable it for thinking models).
+        let reasoning_value = match m.reasoning_content() {
+            // Always echo reasoning back when the model provided it, even if the
+            // provider wasn't explicitly configured for thinking (DeepSeek/Kimi
+            // auto-enable it for thinking models).
             Some(text) => Some(text),
-            // When targeting a thinking-aware backend, ensure the field
-            // is present on assistant messages even if empty.
+            // When targeting a thinking-aware backend, ensure the field is
+            // present on assistant messages even if empty.
             None if include_reasoning && role == "assistant" => Some(""),
             None => None,
+        };
+        let (reasoning_content, reasoning) = match reasoning_key {
+            super::ReasoningHistoryKey::ReasoningContent => (reasoning_value, None),
+            super::ReasoningHistoryKey::Reasoning => (None, reasoning_value),
         };
         Self {
             role,
@@ -184,7 +232,11 @@ impl<'a> WireMessage<'a> {
                 ))
             } else {
                 // System, tool, assistant, and text-only user messages:
-                // plain string content (OpenAI wire format requirement).
+                // plain string content (OpenAI wire format requirement). Note:
+                // the Chat Completions protocol has no image content on `tool`
+                // messages, so any image a tool returns (e.g. a screenshot) is
+                // intentionally dropped here - only its text survives. Anthropic
+                // carries such images; see its wire layer.
                 let text = m.text_content();
                 if text.is_empty() && !m.tool_calls.is_empty() {
                     // Assistant messages with only tool_calls and no text
@@ -195,6 +247,7 @@ impl<'a> WireMessage<'a> {
                 }
             },
             reasoning_content,
+            reasoning,
             tool_calls: m
                 .tool_calls
                 .iter()
@@ -228,6 +281,8 @@ pub(crate) struct Usage {
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Choice {
     pub message: ResponseMessage,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -239,6 +294,10 @@ pub(crate) struct ResponseMessage {
     pub content: String,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Fallback reasoning field - some OpenAI-compatible servers (notably
+    /// `gpt-oss`) emit `reasoning` instead of `reasoning_content`.
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<ResponseToolCall>,
 }
@@ -278,9 +337,9 @@ pub(crate) struct StreamChunk {
 pub(crate) struct StreamChoice {
     #[serde(default)]
     pub delta: StreamDelta,
-    /// Present in every streaming chunk but not consumed by our parser.
-    #[serde(default, rename = "finish_reason")]
-    pub _finish_reason: Option<String>,
+    /// The reason generation stopped; present on the final chunk's choice.
+    #[serde(default)]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -289,6 +348,9 @@ pub(crate) struct StreamDelta {
     pub content: String,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// Fallback reasoning field (see [`ResponseMessage::reasoning`]).
+    #[serde(default)]
+    pub reasoning: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<StreamToolCallDelta>,
 }
@@ -344,11 +406,24 @@ impl TryFrom<ResponseMessage> for Message {
             token_count: None,
             context_tokens: None,
             compacted: false,
+            finish_reason: None,
         };
-        if let Some(rc) = m.reasoning_content {
+        if let Some(rc) = m.reasoning_content.or(m.reasoning) {
             msg.set_reasoning_content(rc);
         }
         Ok(msg)
+    }
+}
+
+/// Map an OpenAI-compatible `finish_reason` string to the cross-provider
+/// [`FinishReason`]. Unknown values are preserved via [`FinishReason::Other`].
+pub(crate) fn map_finish_reason(raw: &str) -> FinishReason {
+    match raw {
+        "stop" => FinishReason::Stop,
+        "length" => FinishReason::Length,
+        "tool_calls" | "function_call" => FinishReason::ToolCalls,
+        "content_filter" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.to_string()),
     }
 }
 
@@ -398,6 +473,7 @@ mod tests {
             role: "unknown".into(),
             content: String::new(),
             reasoning_content: None,
+            reasoning: None,
             tool_calls: Vec::new(),
         };
         let err = Message::try_from(m).unwrap_err();
@@ -526,6 +602,61 @@ mod tests {
     }
 
     #[test]
+    fn response_message_falls_back_to_reasoning_field() {
+        // gpt-oss and some OpenAI-compatible servers use `reasoning`.
+        let raw = r#"{"role":"assistant","content":"hi","reasoning":"because"}"#;
+        let m: ResponseMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.reasoning.as_deref(), Some("because"));
+        let msg = Message::try_from(m).unwrap();
+        assert_eq!(msg.reasoning_content(), Some("because"));
+    }
+
+    #[test]
+    fn reasoning_content_takes_precedence_over_reasoning() {
+        let raw = r#"{"role":"assistant","content":"hi","reasoning_content":"a","reasoning":"b"}"#;
+        let m: ResponseMessage = serde_json::from_str(raw).unwrap();
+        let msg = Message::try_from(m).unwrap();
+        assert_eq!(msg.reasoning_content(), Some("a"));
+    }
+
+    #[test]
+    fn map_finish_reason_covers_known_and_unknown() {
+        assert_eq!(map_finish_reason("stop"), FinishReason::Stop);
+        assert_eq!(map_finish_reason("length"), FinishReason::Length);
+        assert_eq!(map_finish_reason("tool_calls"), FinishReason::ToolCalls);
+        assert_eq!(map_finish_reason("function_call"), FinishReason::ToolCalls);
+        assert_eq!(
+            map_finish_reason("content_filter"),
+            FinishReason::ContentFilter
+        );
+        assert_eq!(
+            map_finish_reason("weird"),
+            FinishReason::Other("weird".into())
+        );
+    }
+
+    #[test]
+    fn reasoning_history_key_selects_wire_field() {
+        let mut msg = Message::assistant("hi");
+        msg.set_reasoning_content("thinking");
+
+        let default = WireMessage::new_with_key(
+            &msg,
+            true,
+            crate::openai::ReasoningHistoryKey::ReasoningContent,
+        );
+        let j = serde_json::to_value(&default).unwrap();
+        assert_eq!(j["reasoning_content"], "thinking");
+        assert!(j.get("reasoning").is_none());
+
+        let cerebras =
+            WireMessage::new_with_key(&msg, true, crate::openai::ReasoningHistoryKey::Reasoning);
+        let j = serde_json::to_value(&cerebras).unwrap();
+        assert_eq!(j["reasoning"], "thinking");
+        assert!(j.get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn chat_request_serializes_reasoning_effort_and_thinking() {
         let msg = Message::user("hi");
         let body = ChatRequest {
@@ -538,12 +669,38 @@ mod tests {
             thinking: Some(ThinkingConfig {
                 r#type: "enabled",
                 keep: Some("all"),
+                budget_tokens: Some(2048),
             }),
+            ..Default::default()
         };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["reasoning_effort"], "high");
         assert_eq!(json["thinking"]["type"], "enabled");
         assert_eq!(json["thinking"]["keep"], "all");
+        assert_eq!(json["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn chat_request_omits_thinking_budget_tokens_when_none() {
+        let msg = Message::user("hi");
+        let body = ChatRequest {
+            model: "gpt-4",
+            messages: vec![WireMessage::new(&msg, false)],
+            tools: None,
+            stream: false,
+            stream_options: None,
+            thinking: Some(ThinkingConfig {
+                r#type: "enabled",
+                keep: None,
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        let thinking = json["thinking"].as_object().unwrap();
+        assert_eq!(thinking["type"], "enabled");
+        assert!(!thinking.contains_key("keep"));
+        assert!(!thinking.contains_key("budget_tokens"));
     }
 
     #[test]
@@ -555,11 +712,41 @@ mod tests {
             tools: None,
             stream: false,
             stream_options: None,
-            reasoning_effort: None,
-            thinking: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(&body).unwrap();
         assert!(!json.as_object().unwrap().contains_key("reasoning_effort"));
         assert!(!json.as_object().unwrap().contains_key("thinking"));
+    }
+
+    #[test]
+    fn chat_request_serializes_sampling_fields() {
+        let msg = Message::user("hi");
+        let stop = vec!["STOP".to_string()];
+        let body = ChatRequest {
+            model: "gpt-4",
+            messages: vec![WireMessage::new(&msg, false)],
+            tools: None,
+            stream: false,
+            stream_options: None,
+            reasoning_effort: None,
+            thinking: None,
+            temperature: Some(0.5),
+            top_p: Some(0.25),
+            frequency_penalty: Some(0.125),
+            presence_penalty: Some(0.75),
+            seed: Some(7),
+            max_tokens: Some(100),
+            stop: Some(&stop),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["temperature"], 0.5);
+        assert_eq!(json["top_p"], 0.25);
+        assert_eq!(json["frequency_penalty"], 0.125);
+        assert_eq!(json["presence_penalty"], 0.75);
+        assert_eq!(json["seed"], 7);
+        assert_eq!(json["max_tokens"], 100);
+        assert_eq!(json["stop"], serde_json::json!(["STOP"]));
     }
 }

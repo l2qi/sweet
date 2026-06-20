@@ -13,7 +13,7 @@ use sweet_core::message::{ContentBlock, Message, Role, ToolCall};
 use sweet_core::model::Model;
 use sweet_core::permission::{ApprovalDecision, PermissionMode, PermissionState, ToolRisk};
 use sweet_core::session::{InMemorySession, MemoryItem, Session};
-use sweet_core::tool::{ToolError, ToolSpec};
+use sweet_core::tool::{ToolError, ToolOutput, ToolSpec};
 use sweet_core::Result;
 
 /// Trait for types that can be converted into user message content blocks.
@@ -72,7 +72,7 @@ pub struct Agent<M: Model> {
     prompts: Vec<PromptSpec>,
     /// Prompts recomputed every turn and appended to the composed system
     /// instructions. Unlike `prompts`, their text is not fixed at construction
-    /// — see [`crate::dynamic_prompt::DynamicPrompt`].
+    /// - see [`crate::dynamic_prompt::DynamicPrompt`].
     dynamic_prompts: Vec<Arc<dyn DynamicPrompt>>,
     tools: Vec<ToolSpec>,
     handoffs: Vec<HandoffSpec>,
@@ -82,7 +82,7 @@ pub struct Agent<M: Model> {
     /// [`crate::subagent::SubagentContext::parent_model`] so they can inherit
     /// the parent's model instead of constructing their own.
     shareable_model: Option<Arc<dyn Model>>,
-    /// Run-scoped permission state — mode plus session-level approvals.
+    /// Run-scoped permission state - mode plus session-level approvals.
     /// Shared via `Arc` so it survives agent switches mid-run.
     permission: Arc<PermissionState>,
 }
@@ -216,7 +216,7 @@ impl<M: Model> Agent<M> {
         self.with_capabilities(registry.capabilities())
     }
 
-    /// The tools registered on this agent — native tools, MCP tools, and
+    /// The tools registered on this agent - native tools, MCP tools, and
     /// subagents (which are registered as tools).
     pub fn tools(&self) -> &[ToolSpec] {
         &self.tools
@@ -251,7 +251,7 @@ impl<M: Model> Agent<M> {
         self.permission.mode()
     }
 
-    /// Set the permission mode in place. Takes `&self` — safe to call
+    /// Set the permission mode in place. Takes `&self` - safe to call
     /// through a shared reference (e.g. while another task holds the
     /// agent mutex).
     pub fn set_permission_mode(&self, mode: PermissionMode) {
@@ -313,7 +313,7 @@ impl<M: Model> Agent<M> {
     /// always resolves every call before the next message is appended, and an
     /// abort can only interrupt the turn in progress. Synthetic results are
     /// appended to the end of the session, so the repaired message must be
-    /// the last non-tool message — hence the trailing-only scan.
+    /// the last non-tool message - hence the trailing-only scan.
     pub fn repair_orphaned_tool_calls(&mut self) -> Result<bool> {
         let items = self.session.items();
 
@@ -525,25 +525,17 @@ impl<M: Model> Agent<M> {
                         }
                         _ => None,
                     };
-                    let result_str = match &result {
-                        Ok(s) => s.clone(),
-                        Err(ToolError::Handoff { target, .. }) => {
-                            format!("Handoff to {} initiated.", target)
-                        }
-                        Err(e) => format!("Error: {e}"),
-                    };
+                    let (display, message) = tool_result_to_message(&call.id, &result);
                     self.fire_hook(
                         HookEvent::AfterToolCall,
                         serde_json::json!({
                             "call": json_value(&call),
-                            "result": result_str.clone(),
+                            "result": display.clone(),
                         }),
                     )
                     .await?;
-                    io.on_tool_result(&call, &result_str).await?;
-                    self.session.push(MemoryItem::Message(Message::tool_result(
-                        &call.id, result_str,
-                    )))?;
+                    io.on_tool_result(&call, &display).await?;
+                    self.session.push(MemoryItem::Message(message))?;
                     if let Some((target, payload)) = handoff {
                         early_handoff = Some(TurnResult::Handoff {
                             target,
@@ -559,7 +551,7 @@ impl<M: Model> Agent<M> {
             None => TurnResult::Message(match self.session.items().last() {
                 Some(MemoryItem::Message(m)) => m.clone(),
                 _ => panic!(
-                    "session lost the assistant message — step_stream loop pushed at least one"
+                    "session lost the assistant message - step_stream loop pushed at least one"
                 ),
             }),
         };
@@ -679,7 +671,7 @@ impl<M: Model> Agent<M> {
     /// - `BeforeToolCall` hooks fire for every call in invocation order
     ///   *before* any tool begins executing. This batched-hook view differs
     ///   from sequential dispatch, where each hook sees prior calls' results
-    ///   already in the session — an intrinsic consequence of running the
+    ///   already in the session - an intrinsic consequence of running the
     ///   tools in parallel.
     /// - Tools execute concurrently via [`FuturesUnordered`].
     /// - `AfterToolCall` hooks, [`AgentIo::on_tool_result`], and session
@@ -712,7 +704,7 @@ impl<M: Model> Agent<M> {
         // Phase 2: Launch tool calls concurrently. ReadOnly tools never
         // require approval (see `needs_approval`), so the permission gate is
         // intentionally absent. `all_read_only` guarantees every call resolves
-        // to a known tool — `expect` documents that invariant.
+        // to a known tool - `expect` documents that invariant.
         let mut unordered: FuturesUnordered<_> = calls
             .iter()
             .enumerate()
@@ -733,7 +725,7 @@ impl<M: Model> Agent<M> {
 
         // Phase 3: Drain completions, but fire AfterToolCall, IO, and session
         // pushes in invocation order with backpressure.
-        let mut slots: Vec<Option<(ToolCall, std::result::Result<String, ToolError>)>> =
+        let mut slots: Vec<Option<(ToolCall, std::result::Result<ToolOutput, ToolError>)>> =
             (0..calls.len()).map(|_| None).collect();
         let mut next_to_emit = 0usize;
         let mut handoff: Option<(String, String)> = None;
@@ -747,25 +739,17 @@ impl<M: Model> Agent<M> {
                         handoff = Some((target.clone(), payload.clone()));
                     }
                 }
-                let result_str = match &result {
-                    Ok(s) => s.clone(),
-                    Err(ToolError::Handoff { target, .. }) => {
-                        format!("Handoff to {} initiated.", target)
-                    }
-                    Err(e) => format!("Error: {e}"),
-                };
+                let (display, message) = tool_result_to_message(&call.id, &result);
                 self.fire_hook(
                     HookEvent::AfterToolCall,
                     serde_json::json!({
                         "call": json_value(&call),
-                        "result": result_str.clone(),
+                        "result": display.clone(),
                     }),
                 )
                 .await?;
-                io.on_tool_result(&call, &result_str).await?;
-                self.session.push(MemoryItem::Message(Message::tool_result(
-                    &call.id, result_str,
-                )))?;
+                io.on_tool_result(&call, &display).await?;
+                self.session.push(MemoryItem::Message(message))?;
                 next_to_emit += 1;
             }
         }
@@ -777,7 +761,7 @@ impl<M: Model> Agent<M> {
         &self,
         call: &ToolCall,
         turn_index: usize,
-    ) -> std::result::Result<String, ToolError> {
+    ) -> std::result::Result<ToolOutput, ToolError> {
         let tool = self.tools.iter().find(|t| t.name == call.name).cloned();
         let handoff = self.handoffs.iter().find(|h| h.name == call.name).cloned();
 
@@ -802,12 +786,12 @@ impl<M: Model> Agent<M> {
         &self,
         call: &ToolCall,
         io: &mut (impl AgentIo + ?Sized),
-    ) -> Option<std::result::Result<String, ToolError>> {
+    ) -> Option<std::result::Result<ToolOutput, ToolError>> {
         let risk = match self.tools.iter().find(|t| t.name == call.name) {
             Some(tool) => tool.risk,
             None => {
                 // Handoff tools are always read-only. An unknown name is left
-                // for `dispatch` to reject — no point gating a call that
+                // for `dispatch` to reject - no point gating a call that
                 // cannot run.
                 if self.handoffs.iter().any(|h| h.name == call.name) {
                     ToolRisk::ReadOnly
@@ -821,8 +805,8 @@ impl<M: Model> Agent<M> {
             return None;
         }
 
-        // Session approvals are keyed by (tool, scope) — the same scope shown
-        // in the prompt — so "Always" grants exactly what the user saw.
+        // Session approvals are keyed by (tool, scope) - the same scope shown
+        // in the prompt - so "Always" grants exactly what the user saw.
         let scope = sweet_core::permission::approval_scope(&call.arguments);
         if self.permission.is_allowed(&call.name, &scope) {
             return None;
@@ -895,7 +879,7 @@ async fn observe_tool_call(
     tool: &ToolSpec,
     call: ToolCall,
     turn_index: usize,
-) -> (ToolCall, std::result::Result<String, ToolError>) {
+) -> (ToolCall, std::result::Result<ToolOutput, ToolError>) {
     tracing::debug!(
         target: "sweet_agent::observability",
         event = "tool.call.start",
@@ -906,7 +890,7 @@ async fn observe_tool_call(
         "tool call start"
     );
     let started = Instant::now();
-    let result = tool.call(call.arguments.clone()).await;
+    let result = tool.call_rich(call.arguments.clone()).await;
     let duration_ms = elapsed_ms(started);
     match &result {
         Ok(output) => tracing::debug!(
@@ -933,6 +917,29 @@ async fn observe_tool_call(
         ),
     }
     (call, result)
+}
+
+/// Turn a tool-call result into the display text (for IO + hooks) and the
+/// `Role::Tool` session message. On success the message carries the tool's full
+/// content blocks (text and any images); errors and handoffs become plain text.
+fn tool_result_to_message(
+    call_id: &str,
+    result: &std::result::Result<ToolOutput, ToolError>,
+) -> (String, Message) {
+    match result {
+        Ok(output) => (
+            output.text_content(),
+            Message::tool_result_blocks(call_id, output.blocks.clone()),
+        ),
+        Err(ToolError::Handoff { target, .. }) => {
+            let s = format!("Handoff to {target} initiated.");
+            (s.clone(), Message::tool_result(call_id, s))
+        }
+        Err(e) => {
+            let s = format!("Error: {e}");
+            (s.clone(), Message::tool_result(call_id, s))
+        }
+    }
 }
 
 fn json_string<T: serde::Serialize + ?Sized>(value: &T) -> String {
@@ -1068,7 +1075,7 @@ mod tests {
     async fn dynamic_prompt_is_rendered_fresh_after_static_parts_each_turn() {
         // `render` is a pure projection of shared state (it may be called more
         // than once per turn), so we mutate the state between turns and assert
-        // the system prompt tracks it — landing after the static instructions.
+        // the system prompt tracks it - landing after the static instructions.
         struct Live(Mutex<String>);
         impl crate::dynamic_prompt::DynamicPrompt for Live {
             fn render(&self) -> Option<String> {
@@ -1218,7 +1225,7 @@ mod tests {
         assert!(matches!(result, TurnResult::Message(_)));
 
         let recorded = events.lock().unwrap().clone();
-        // Exactly one BeforeTurn before everything, one AfterTurn after — even
+        // Exactly one BeforeTurn before everything, one AfterTurn after - even
         // though the turn looped through a tool call (two model replies).
         assert_eq!(recorded, vec![HookEvent::BeforeTurn, HookEvent::AfterTurn]);
     }

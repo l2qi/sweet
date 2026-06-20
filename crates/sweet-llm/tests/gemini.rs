@@ -218,7 +218,7 @@ async fn complete_round_trips_thought_signature() {
                     {"functionCall": {"name": "calc", "args": {"x": 1}, "id": "call_1"}, "thoughtSignature": "sig-abc-123"}
                 ]},
                 {"role": "user", "parts": [
-                    {"functionResponse": {"name": "calc", "response": {"result": "2"}}}
+                    {"functionResponse": {"name": "calc", "response": {"name": "calc", "content": "2"}}}
                 ]}
             ]
         })))

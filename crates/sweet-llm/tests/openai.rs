@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use serial_test::serial;
 use sweet_core::{ContentBlock, Message, Model};
 use sweet_llm::openai::ReasoningContent;
-use sweet_llm::{openai, OpenAIProvider, ProviderError};
+use sweet_llm::{openai, OpenAIProvider, ProviderError, ReasoningConfig};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -23,6 +23,14 @@ fn canned_response(content: &str) -> serde_json::Value {
             "finish_reason": "stop"
         }]
     })
+}
+
+/// Expected assistant reply for a `canned_response` (which carries
+/// `finish_reason: "stop"`).
+fn assistant_stop(text: &str) -> Message {
+    let mut m = Message::assistant(text);
+    m.finish_reason = Some(sweet_core::FinishReason::Stop);
+    m
 }
 
 #[tokio::test]
@@ -57,7 +65,7 @@ async fn complete_posts_correct_request_and_returns_assistant_message() {
         .await
         .expect("complete should succeed");
 
-    assert_eq!(reply, Message::assistant("hi there"));
+    assert_eq!(reply, assistant_stop("hi there"));
 }
 
 #[tokio::test]
@@ -105,7 +113,7 @@ async fn image_user_message_sends_multimodal_parts_array() {
         .await
         .expect("complete should succeed");
 
-    assert_eq!(reply, Message::assistant("a tiny png"));
+    assert_eq!(reply, assistant_stop("a tiny png"));
 }
 
 #[tokio::test]
@@ -156,7 +164,7 @@ async fn file_user_message_sends_file_content_part() {
         .await
         .expect("complete should succeed");
 
-    assert_eq!(reply, Message::assistant("looks good"));
+    assert_eq!(reply, assistant_stop("looks good"));
 }
 
 #[tokio::test]
@@ -195,14 +203,13 @@ async fn complete_extracts_reasoning_content_from_response() {
 }
 
 #[tokio::test]
-async fn complete_sends_reasoning_effort_and_thinking_when_configured() {
+async fn complete_sends_thinking_object_when_toggle_configured() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
         .and(body_partial_json(serde_json::json!({
-            "reasoning_effort": "max",
             "thinking": {"type": "enabled", "keep": "all"}
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(canned_response("ok")))
@@ -212,8 +219,56 @@ async fn complete_sends_reasoning_effort_and_thinking_when_configured() {
 
     let provider = OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
-        .with_reasoning_effort("max")
-        .with_thinking(sweet_llm::openai::ThinkingMode::PRESERVED);
+        .with_reasoning(ReasoningConfig::Toggle(true))
+        .with_preserved_reasoning_history(true);
+
+    provider
+        .complete(&[Message::user("hi")], &[])
+        .await
+        .expect("complete should succeed");
+}
+
+#[tokio::test]
+async fn complete_sends_reasoning_effort_when_effort_configured() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "reasoning_effort": "max"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(canned_response("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_reasoning(ReasoningConfig::Effort("max".to_string()));
+
+    provider
+        .complete(&[Message::user("hi")], &[])
+        .await
+        .expect("complete should succeed");
+}
+
+#[tokio::test]
+async fn complete_sends_thinking_budget_when_budget_configured() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "thinking": {"type": "enabled", "budget_tokens": 2048}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(canned_response("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_reasoning(ReasoningConfig::Budget(2048));
 
     provider
         .complete(&[Message::user("hi")], &[])
@@ -269,7 +324,7 @@ async fn complete_echoes_reasoning_content_on_messages_when_thinking_configured(
 
     let provider = OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
-        .with_thinking(sweet_llm::openai::ThinkingMode::PRESERVED);
+        .with_reasoning(ReasoningConfig::Toggle(true));
 
     let mut prior = Message::assistant("prev");
     prior.set_reasoning_content("hidden");
@@ -303,7 +358,7 @@ async fn complete_echoes_empty_reasoning_content_for_assistant_when_thinking_con
 
     let provider = OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
-        .with_thinking(sweet_llm::openai::ThinkingMode::PRESERVED);
+        .with_reasoning(ReasoningConfig::Toggle(true));
 
     let prior = Message::assistant("prev"); // no reasoning_content set
 
@@ -385,7 +440,7 @@ async fn complete_logs_full_request_response_and_conversion_errors_without_api_k
     })
     .await;
 
-    assert_eq!(reply, Message::assistant("hi there"));
+    assert_eq!(reply, assistant_stop("hi there"));
     assert!(bad_err.contains("provider error"), "{bad_err}");
     assert!(logs.contains("openai.complete.start"), "{logs}");
     assert!(logs.contains("openai.complete"), "{logs}");

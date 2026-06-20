@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::message::ContentBlock;
 use crate::permission::ToolRisk;
 
 /// Describes a model-facing tool and carries its executable handler.
@@ -47,12 +48,88 @@ impl ToolSpec {
     pub async fn call(&self, args: serde_json::Value) -> Result<String, ToolError> {
         self.handler.call(args).await
     }
+
+    /// Rich variant of [`call`](Self::call) that may return image content
+    /// alongside text (e.g. a screenshot). See [`ToolOutput`].
+    pub async fn call_rich(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        self.handler.call_rich(args).await
+    }
+}
+
+/// The content a tool returns to the model: text, optionally with images.
+///
+/// [`ToolHandler::call`] yields a plain `String`; the framework wraps it in a
+/// single text block. Tools that need to show the model an image override
+/// [`ToolHandler::call_rich`] and attach image blocks via
+/// [`with_image`](Self::with_image).
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    /// Ordered content blocks (text and/or images).
+    pub blocks: Vec<ContentBlock>,
+}
+
+impl ToolOutput {
+    /// A text-only output.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            blocks: vec![ContentBlock::text(s)],
+        }
+    }
+
+    /// Append an image block (raw bytes + MIME type, e.g. `"image/png"`).
+    pub fn with_image(mut self, data: Vec<u8>, media_type: impl Into<String>) -> Self {
+        self.blocks.push(ContentBlock::Image {
+            data,
+            media_type: media_type.into(),
+        });
+        self
+    }
+
+    /// The concatenated text of all text blocks (for display and logging).
+    pub fn text_content(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|b| b.as_text())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(s: String) -> Self {
+        Self::text(s)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(s: &str) -> Self {
+        Self::text(s)
+    }
+}
+
+impl std::fmt::Display for ToolOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for block in &self.blocks {
+            write!(f, "{block}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Executable handler for a [`ToolSpec`].
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     async fn call(&self, args: serde_json::Value) -> Result<String, ToolError>;
+
+    /// Rich variant that may return images alongside text. The default wraps
+    /// [`call`](Self::call)'s text. Tools that surface an image to the model
+    /// (e.g. a screenshot) override this. Whether the image survives to the
+    /// provider depends on the wire protocol: Anthropic carries images on
+    /// tool-result messages; the OpenAI / Chat Completions protocol does not,
+    /// so images are dropped there and only the text remains.
+    async fn call_rich(&self, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(self.call(args).await?))
+    }
 }
 
 /// Logic trait implemented by the user. Kept separate from [`ToolHandler`] so
@@ -72,7 +149,7 @@ pub enum ToolError {
     UnknownTool(String),
     #[error("execution failed: {0}")]
     Execution(#[source] Box<dyn StdError + Send + Sync>),
-    /// A handoff was requested. This is not a true error — it signals that
+    /// A handoff was requested. This is not a true error - it signals that
     /// the agent step loop should be interrupted and control transferred.
     #[error("handoff to {target}")]
     Handoff { target: String, payload: String },

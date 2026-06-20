@@ -7,7 +7,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use sweet_core::{ContentBlock, Message, Role, ToolCall};
+use sweet_core::{ContentBlock, FinishReason, Message, Role, ThinkingContent, ToolCall};
 
 use crate::error::ProviderError;
 
@@ -25,6 +25,8 @@ pub(crate) struct GenerateContentRequest<'a> {
     pub tools: Option<Vec<Tool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +67,11 @@ pub(crate) struct Part {
     /// Inline binary data sent to the model (images, documents).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_data: Option<InlineData>,
+    /// `true` on thought-summary parts the API returns when `includeThoughts`
+    /// is set. Such parts carry reasoning, not visible output, and are routed
+    /// into the message's thinking content rather than its text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought: Option<bool>,
 }
 
 /// Inline binary data for a Gemini content part (images, documents).
@@ -108,7 +115,44 @@ pub(crate) struct FunctionDeclaration<'a> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GenerationConfig {
-    pub max_output_tokens: usize,
+    /// Per-model output cap. Omitted when unset so the model applies its own
+    /// default rather than a hardcoded (and often too-low) ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_config: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stop_sequences: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<Value>,
+}
+
+/// Gemini's `thinkingConfig` reasoning controls. `thinkingBudget` is a signed
+/// integer (`-1` = dynamic, `0` = off); `thinkingLevel` is the Gemini 3+
+/// effort knob.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThinkingConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_thoughts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +172,7 @@ pub(crate) struct GenerateContentResponse {
 pub(crate) struct Candidate {
     pub content: Content,
     #[serde(default)]
-    pub _finish_reason: Option<String>,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,14 +239,14 @@ pub(crate) fn convert_messages(
                 let tc_id = tool_msg.tool_call_id.clone().unwrap_or_default();
                 let name = tool_names.get(&tc_id).cloned().unwrap_or_default();
                 parts.push(Part {
-                    text: None,
-                    function_call: None,
                     function_response: Some(FunctionResponse {
-                        name,
-                        response: serde_json::json!({ "result": tool_msg.text_content() }),
+                        name: name.clone(),
+                        response: serde_json::json!({
+                            "name": name,
+                            "content": tool_msg.text_content(),
+                        }),
                     }),
-                    thought_signature: None,
-                    inline_data: None,
+                    ..Default::default()
                 });
                 i += 1;
             }
@@ -221,10 +265,7 @@ pub(crate) fn convert_messages(
                         ContentBlock::Text { text } if !text.is_empty() => {
                             parts.push(Part {
                                 text: Some(text.clone()),
-                                function_call: None,
-                                function_response: None,
-                                thought_signature: None,
-                                inline_data: None,
+                                ..Default::default()
                             });
                         }
                         ContentBlock::Image { data, media_type }
@@ -232,14 +273,11 @@ pub(crate) fn convert_messages(
                             data, media_type, ..
                         } => {
                             parts.push(Part {
-                                text: None,
-                                function_call: None,
-                                function_response: None,
-                                thought_signature: None,
                                 inline_data: Some(InlineData {
                                     mime_type: media_type.clone(),
                                     data: base64::prelude::BASE64_STANDARD.encode(data),
                                 }),
+                                ..Default::default()
                             });
                         }
                         _ => {}
@@ -248,10 +286,7 @@ pub(crate) fn convert_messages(
                 if parts.is_empty() {
                     parts.push(Part {
                         text: Some(String::new()),
-                        function_call: None,
-                        function_response: None,
-                        thought_signature: None,
-                        inline_data: None,
+                        ..Default::default()
                     });
                 }
                 contents.push(Content {
@@ -263,10 +298,7 @@ pub(crate) fn convert_messages(
                     role: "user".into(),
                     parts: vec![Part {
                         text: Some(msg.text_content()),
-                        function_call: None,
-                        function_response: None,
-                        thought_signature: None,
-                        inline_data: None,
+                        ..Default::default()
                     }],
                 });
             }
@@ -280,34 +312,26 @@ pub(crate) fn convert_messages(
         if !assistant_text.is_empty() {
             parts.push(Part {
                 text: Some(assistant_text),
-                function_call: None,
-                function_response: None,
-                thought_signature: None,
-                inline_data: None,
+                ..Default::default()
             });
         }
         for tc in &msg.tool_calls {
             let thought_signature = thought_signatures.get(&tc.id).cloned();
             parts.push(Part {
-                text: None,
                 function_call: Some(FunctionCall {
                     name: tc.name.clone(),
                     args: tc.arguments.clone(),
                     id: tc.id.clone(),
                 }),
-                function_response: None,
                 thought_signature,
-                inline_data: None,
+                ..Default::default()
             });
         }
         if parts.is_empty() {
             // Gemini requires non-empty parts; emit an empty text part.
             parts.push(Part {
                 text: Some(String::new()),
-                function_call: None,
-                function_response: None,
-                thought_signature: None,
-                inline_data: None,
+                ..Default::default()
             });
         }
         contents.push(Content {
@@ -324,9 +348,9 @@ pub(crate) fn convert_messages(
 /// subsequent turns.
 pub(crate) struct ParsedResponse {
     pub message: Message,
-    /// `tool_call_id → thoughtSignature`
+    /// `tool_call_id -> thoughtSignature`
     pub thought_signatures: Vec<(String, String)>,
-    /// `tool_call_id → function_name`
+    /// `tool_call_id -> function_name`
     pub tool_names: Vec<(String, String)>,
 }
 
@@ -342,16 +366,24 @@ pub(crate) fn parse_response(
         .ok_or(ProviderError::EmptyResponse)?;
 
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     let mut thought_signatures = Vec::new();
     let mut tool_names = Vec::new();
+    let finish_reason = candidate.finish_reason.as_deref().map(map_finish_reason);
 
     for part in candidate.content.parts {
         if let Some(text) = part.text {
-            if !content.is_empty() {
-                content.push('\n');
+            // Thought-summary parts (returned with `includeThoughts`) carry
+            // reasoning, not visible output - keep them out of `content`.
+            if part.thought == Some(true) {
+                thinking.push_str(&text);
+            } else {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&text);
             }
-            content.push_str(&text);
         }
         if let Some(fc) = part.function_call {
             if let Some(sig) = part.thought_signature {
@@ -369,6 +401,12 @@ pub(crate) fn parse_response(
     let token_count = resp.usage_metadata.as_ref().map(|u| u.total_token_count);
     let context_tokens = resp.usage_metadata.as_ref().map(|u| u.prompt_token_count);
 
+    let thinking_content = if thinking.is_empty() {
+        Vec::new()
+    } else {
+        vec![ThinkingContent::new(thinking)]
+    };
+
     // Gemini assistant responses only carry text in part.text; collapse the
     // joined text into a single `Text` block. If Gemini ever starts returning
     // image content here this would need to be extended.
@@ -376,16 +414,30 @@ pub(crate) fn parse_response(
         message: Message {
             role: Role::Assistant,
             content: vec![sweet_core::ContentBlock::text(content)],
-            thinking_content: Vec::new(),
+            thinking_content,
             tool_calls,
             tool_call_id: None,
             token_count,
             context_tokens,
             compacted: false,
+            finish_reason,
         },
         thought_signatures,
         tool_names,
     })
+}
+
+/// Map a Gemini `finishReason` to the cross-provider [`FinishReason`]. Safety /
+/// recitation stops collapse to `ContentFilter`; unknown values are preserved.
+pub(crate) fn map_finish_reason(raw: &str) -> FinishReason {
+    match raw {
+        "STOP" => FinishReason::Stop,
+        "MAX_TOKENS" => FinishReason::Length,
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => {
+            FinishReason::ContentFilter
+        }
+        other => FinishReason::Other(other.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -394,9 +446,8 @@ mod tests {
     use sweet_core::{ContentBlock, Message, ToolCall};
 
     // ---------------------------------------------------------------------
-    // convert_messages — the Gemini wire format requires tool-result content
-    // to be a plain string inside `{"result": "..."}`, not an array of typed
-    // content blocks.
+    // convert_messages - tool results map to a `functionResponse` whose
+    // `response` is `{ name, content }` (the documented Gemini shape).
     // ---------------------------------------------------------------------
 
     fn tool_msg(id: &str, content: &str) -> Message {
@@ -404,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_response_serializes_as_plain_string() {
+    fn tool_result_response_uses_name_and_content() {
         let mut names = HashMap::new();
         names.insert("call_1".to_string(), "echo".to_string());
 
@@ -413,10 +464,9 @@ mod tests {
         assert_eq!(contents.len(), 1);
         let part = &contents[0].parts[0];
         let resp = part.function_response.as_ref().unwrap();
-        // result must be a JSON string, not an array of content blocks.
         assert_eq!(
             resp.response,
-            serde_json::json!({ "result": "hello world" })
+            serde_json::json!({ "name": "echo", "content": "hello world" })
         );
         assert_eq!(resp.name, "echo");
     }
@@ -435,7 +485,7 @@ mod tests {
         let resp = contents[0].parts[0].function_response.as_ref().unwrap();
         assert_eq!(
             resp.response,
-            serde_json::json!({ "result": "part-apart-b" })
+            serde_json::json!({ "name": "echo", "content": "part-apart-b" })
         );
     }
 
@@ -453,11 +503,17 @@ mod tests {
         assert_eq!(contents[0].parts.len(), 2);
 
         let r1 = contents[0].parts[0].function_response.as_ref().unwrap();
-        assert_eq!(r1.response, serde_json::json!({ "result": "r1" }));
+        assert_eq!(
+            r1.response,
+            serde_json::json!({ "name": "a", "content": "r1" })
+        );
         assert_eq!(r1.name, "a");
 
         let r2 = contents[0].parts[1].function_response.as_ref().unwrap();
-        assert_eq!(r2.response, serde_json::json!({ "result": "r2" }));
+        assert_eq!(
+            r2.response,
+            serde_json::json!({ "name": "b", "content": "r2" })
+        );
         assert_eq!(r2.name, "b");
     }
 
@@ -469,11 +525,14 @@ mod tests {
         let (_, contents) = convert_messages(&msgs, &HashMap::new(), &HashMap::new());
         let resp = contents[0].parts[0].function_response.as_ref().unwrap();
         assert_eq!(resp.name, "");
-        assert_eq!(resp.response, serde_json::json!({ "result": "data" }));
+        assert_eq!(
+            resp.response,
+            serde_json::json!({ "name": "", "content": "data" })
+        );
     }
 
     #[test]
-    fn full_request_serializes_tool_result_as_plain_string() {
+    fn full_request_serializes_tool_result_content() {
         // End-to-end: serialize a GenerateContentRequest and inspect the
         // raw JSON to lock in the wire shape Gemini expects.
         let mut names = HashMap::new();
@@ -487,10 +546,54 @@ mod tests {
             contents,
             tools: None,
             generation_config: None,
+            tool_config: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        let result = &json["contents"][0]["parts"][0]["functionResponse"]["response"]["result"];
-        assert_eq!(result, &serde_json::Value::String("ok".to_string()));
+        let content = &json["contents"][0]["parts"][0]["functionResponse"]["response"]["content"];
+        assert_eq!(content, &serde_json::Value::String("ok".to_string()));
+    }
+
+    #[test]
+    fn thought_parts_route_to_thinking_not_content() {
+        let resp = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Content {
+                    role: "model".into(),
+                    parts: vec![
+                        Part {
+                            text: Some("summary of reasoning".into()),
+                            thought: Some(true),
+                            ..Default::default()
+                        },
+                        Part {
+                            text: Some("the answer".into()),
+                            ..Default::default()
+                        },
+                    ],
+                },
+                finish_reason: Some("STOP".into()),
+            }],
+            usage_metadata: None,
+        };
+        let parsed = parse_response(resp).unwrap();
+        assert_eq!(parsed.message.text_content(), "the answer");
+        assert_eq!(parsed.message.thinking_content.len(), 1);
+        assert_eq!(
+            parsed.message.thinking_content[0].text,
+            "summary of reasoning"
+        );
+        assert_eq!(parsed.message.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn map_finish_reason_maps_safety_to_content_filter() {
+        assert_eq!(map_finish_reason("STOP"), FinishReason::Stop);
+        assert_eq!(map_finish_reason("MAX_TOKENS"), FinishReason::Length);
+        assert_eq!(map_finish_reason("SAFETY"), FinishReason::ContentFilter);
+        assert_eq!(
+            map_finish_reason("WHAT"),
+            FinishReason::Other("WHAT".into())
+        );
     }
 
     #[test]
@@ -509,7 +612,7 @@ mod tests {
 
     #[test]
     fn system_message_with_multiple_blocks_joins_text() {
-        // text_content() concatenates all text blocks — verify the wire
+        // text_content() concatenates all text blocks - verify the wire
         // conversion preserves that behaviour for system messages.
         let mut sys_msg = Message::system("");
         sys_msg.content = vec![ContentBlock::text("alpha "), ContentBlock::text("beta")];
@@ -642,6 +745,7 @@ mod tests {
             contents,
             tools: None,
             generation_config: None,
+            tool_config: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         let inline = &json["contents"][0]["parts"][1]["inlineData"];

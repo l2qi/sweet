@@ -22,6 +22,29 @@ impl Role {
     }
 }
 
+/// Why the model stopped generating, normalized across providers.
+///
+/// Providers report this differently (`finish_reason`, `stop_reason`, Gemini's
+/// `finishReason`); each maps its wire value into this enum so callers can
+/// detect truncation (`Length`) and safety stops (`ContentFilter`/`Refusal`)
+/// uniformly. `Other` preserves any unrecognized raw value.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    /// Natural stop (end of turn / stop sequence).
+    Stop,
+    /// Output truncated at the max-tokens / context limit.
+    Length,
+    /// Stopped to emit tool calls.
+    ToolCalls,
+    /// Stopped by a content/safety filter.
+    ContentFilter,
+    /// The model declined to answer (e.g. Anthropic `refusal`).
+    Refusal,
+    /// Any other / unrecognized reason; the raw provider value is preserved.
+    Other(String),
+}
+
 /// A single tool call requested by the assistant.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
@@ -42,6 +65,11 @@ pub struct ThinkingContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub signature: Option<String>,
+    /// Opaque payload of an Anthropic `redacted_thinking` block (the encrypted
+    /// reasoning). When set, `text` is empty and this block replays as a
+    /// `redacted_thinking` block rather than a `thinking` block.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub redacted_data: Option<String>,
 }
 
 impl ThinkingContent {
@@ -49,6 +77,7 @@ impl ThinkingContent {
         Self {
             text: text.into(),
             signature: None,
+            redacted_data: None,
         }
     }
 }
@@ -136,7 +165,7 @@ impl std::fmt::Display for ContentBlock {
     }
 }
 
-/// serde helper for `Vec<u8>` ↔ base64 string.
+/// serde helper for `Vec<u8>` <-> base64 string.
 mod serde_base64 {
     use base64::prelude::*;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -164,7 +193,7 @@ pub struct Message {
     /// Actual token count reported by the provider's `usage` field.
     /// `None` if the provider does not report token usage.
     pub token_count: Option<usize>,
-    /// `usage.prompt_tokens` from the provider response — the actual input
+    /// `usage.prompt_tokens` from the provider response - the actual input
     /// context size at the time of this call. Used for context-window
     /// tracking and compaction threshold decisions.
     pub context_tokens: Option<usize>,
@@ -173,6 +202,11 @@ pub struct Message {
     /// include but that are not part of the original conversation.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub compacted: bool,
+    /// Why the model stopped generating, normalized across providers (`None`
+    /// when the provider reported nothing). Lets the UI flag truncation and
+    /// refusals; only meaningful on assistant replies.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub finish_reason: Option<FinishReason>,
 }
 
 impl Message {
@@ -186,6 +220,7 @@ impl Message {
             token_count: None,
             context_tokens: None,
             compacted: false,
+            finish_reason: None,
         }
     }
 
@@ -208,6 +243,7 @@ impl Message {
             token_count: None,
             context_tokens: None,
             compacted: false,
+            finish_reason: None,
         }
     }
 
@@ -215,17 +251,26 @@ impl Message {
         Self::new(Role::Assistant, content)
     }
 
-    /// Construct a `Role::Tool` message carrying the result of a tool call.
+    /// Construct a `Role::Tool` message carrying the text result of a tool call.
     pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::tool_result_blocks(id, vec![ContentBlock::text(content)])
+    }
+
+    /// Construct a `Role::Tool` message from pre-built content blocks - e.g. text
+    /// plus an image a tool wants the model to see (a screenshot). Images survive
+    /// only on protocols whose tool-result messages accept them (Anthropic);
+    /// others fall back to the text blocks.
+    pub fn tool_result_blocks(id: impl Into<String>, content: Vec<ContentBlock>) -> Self {
         Self {
             role: Role::Tool,
-            content: vec![ContentBlock::text(content)],
+            content,
             thinking_content: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(id.into()),
             token_count: None,
             context_tokens: None,
             compacted: false,
+            finish_reason: None,
         }
     }
 
@@ -241,6 +286,7 @@ impl Message {
             token_count: None,
             context_tokens: None,
             compacted: false,
+            finish_reason: None,
         }
     }
 
@@ -401,6 +447,39 @@ mod tests {
         }
         .is_attachment());
         assert!(!ContentBlock::text("hi").is_attachment());
+    }
+
+    #[test]
+    fn finish_reason_round_trips_including_other() {
+        for (reason, json) in [
+            (FinishReason::Stop, "\"stop\""),
+            (FinishReason::Length, "\"length\""),
+            (FinishReason::ToolCalls, "\"tool_calls\""),
+            (FinishReason::ContentFilter, "\"content_filter\""),
+            (FinishReason::Refusal, "\"refusal\""),
+        ] {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), json);
+            let back: FinishReason = serde_json::from_str(json).unwrap();
+            assert_eq!(back, reason);
+        }
+        let other = FinishReason::Other("weird".into());
+        let s = serde_json::to_string(&other).unwrap();
+        assert_eq!(serde_json::from_str::<FinishReason>(&s).unwrap(), other);
+    }
+
+    #[test]
+    fn finish_reason_absent_is_omitted_and_round_trips() {
+        let msg = Message::assistant("hi");
+        let json = serde_json::to_value(&msg).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("finish_reason"));
+        let back: Message = serde_json::from_value(json).unwrap();
+        assert_eq!(back, msg);
+
+        let mut truncated = Message::assistant("partial");
+        truncated.finish_reason = Some(FinishReason::Length);
+        let round: Message =
+            serde_json::from_str(&serde_json::to_string(&truncated).unwrap()).unwrap();
+        assert_eq!(round.finish_reason, Some(FinishReason::Length));
     }
 
     /// Guard against drift between `Role::as_str` and the serde rename. If
