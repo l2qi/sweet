@@ -79,7 +79,7 @@ impl ProcedureSpec {
 /// Resolves declarative hook subscriptions to executable capabilities.
 ///
 /// The dispatcher owns its hook subscriptions and the procedure/command
-/// targets they bind to, but it does *not* own the tool registry — the
+/// targets they bind to, but it does *not* own the tool registry - the
 /// agent does. Tools are passed into [`HookDispatcher::fire`] at dispatch
 /// time so there is a single source of truth for "what tools does this
 /// agent know about?".

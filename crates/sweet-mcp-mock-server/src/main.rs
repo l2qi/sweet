@@ -3,7 +3,7 @@
 
 //! Mock MCP server for `sweet-mcp`'s hermetic integration tests.
 //!
-//! Exposes two trivial tools — `echo` and `add` — over either transport:
+//! Exposes two trivial tools - `echo` and `add` - over either transport:
 //!
 //! * no args (or `stdio`): serve over stdio (stdin/stdout). Used to exercise
 //!   `McpProvider::connect_stdio` with a real child process.
@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let app = axum::Router::new().fallback_service(service);
 
             // Report the bound address so the test harness can connect, then
-            // flush — stdout is block-buffered when piped to the parent.
+            // flush - stdout is block-buffered when piped to the parent.
             let mut stdout = std::io::stdout();
             writeln!(stdout, "{addr}")?;
             stdout.flush()?;

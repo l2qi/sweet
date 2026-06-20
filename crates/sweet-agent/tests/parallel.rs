@@ -142,7 +142,7 @@ async fn parallel_readonly_tools_complete_concurrently() {
     };
     assert_eq!(content, "done");
 
-    // Sequential execution would take ≥ 400ms. Concurrent runs in ~200ms;
+    // Sequential execution would take >= 400ms. Concurrent runs in ~200ms;
     // the ceiling is generous to absorb scheduler/timer jitter on contended
     // CI runners while still failing loudly if the batch is sequential.
     assert!(
@@ -254,7 +254,7 @@ async fn handoff_in_batch_goes_sequential() {
     ]);
 
     let mut agent = Agent::new(model).with_tool(readonly_spec(slow_a));
-    // No handoff spec registered — the call to "transfer_to_plan" will fail
+    // No handoff spec registered - the call to "transfer_to_plan" will fail
     // as unknown tool in dispatch. The key point is the batch takes the
     // sequential path because all_read_only returns false.
     let reply = agent.step("go").await.unwrap();
@@ -341,7 +341,7 @@ async fn parallel_subagents_both_run() {
     assert_eq!(msgs[3].tool_call_id.as_deref(), Some("c2"));
     assert_eq!(msgs[3].text_content(), "result-b");
 
-    // Concurrent: total time ≈ max(50, 50) = 50ms, not 100ms.
+    // Concurrent: total time ~ max(50, 50) = 50ms, not 100ms.
     assert!(
         elapsed < Duration::from_millis(150),
         "expected concurrent subagent execution, got {elapsed:?}"

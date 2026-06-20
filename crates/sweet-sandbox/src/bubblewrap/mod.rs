@@ -31,7 +31,7 @@ pub struct BubblewrapRunner {
     allowed_write_roots: Vec<PathBuf>,
     /// Tool directories resolved from `$PATH` and known locations.
     tool_roots: Vec<PathBuf>,
-    /// Policy. Fixed at construction time — bwrap toggles the whole
+    /// Policy. Fixed at construction time - bwrap toggles the whole
     /// network namespace with `--unshare-net`, so per-host filtering is not
     /// possible and there is no mid-session escape hatch.
     policy: SandboxPolicy,
@@ -99,7 +99,7 @@ impl BubblewrapRunner {
         }
 
         // Mount safe individual config files from $HOME (e.g. ~/.gitconfig).
-        // These are single files, not directories — only the file itself is visible.
+        // These are single files, not directories - only the file itself is visible.
         for file in tool_paths::resolve_safe_config_files() {
             if let Some(s) = file.to_str() {
                 if file.exists() {
@@ -133,7 +133,7 @@ impl BubblewrapRunner {
 
         // Network isolation. bwrap is binary: share the host's network
         // namespace (Allow) or unshare it (Restricted). No mid-session
-        // toggle — bwrap mounts the namespace once per command and the
+        // toggle - bwrap mounts the namespace once per command and the
         // caller would need to construct a new runner to change it.
         match &self.policy {
             SandboxPolicy::Restricted => args.push("--unshare-net".to_string()),

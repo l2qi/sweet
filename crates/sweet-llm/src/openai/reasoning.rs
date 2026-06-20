@@ -17,7 +17,7 @@ pub trait ReasoningContent {
     fn reasoning_content(&self) -> Option<&str>;
 
     /// Replace `thinking_content` with a single block carrying `text` and no
-    /// signature. Empty `text` is preserved as an empty-text block — Kimi
+    /// signature. Empty `text` is preserved as an empty-text block - Kimi
     /// distinguishes "explicit empty reasoning_content" from "no field
     /// present" on multi-turn requests, and clearing the Vec would lose that
     /// signal.

@@ -68,7 +68,7 @@ impl SqliteMemory {
     }
 
     /// Embed `text` if an embedder is attached; `None` (with a warning) when
-    /// embedding fails — memory durability beats vector coverage.
+    /// embedding fails - memory durability beats vector coverage.
     async fn try_embed(&self, text: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.as_ref()?;
         match embedder.embed(&[text.to_string()]).await {

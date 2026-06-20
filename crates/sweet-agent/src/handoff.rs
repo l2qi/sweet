@@ -19,7 +19,7 @@ use sweet_core::model::Model;
 use sweet_core::permission::ToolRisk;
 use sweet_core::tool::{ToolError, ToolHandler, ToolSpec};
 
-/// Result of a single agent step — either a normal message or a handoff request.
+/// Result of a single agent step - either a normal message or a handoff request.
 #[derive(Debug, Clone)]
 pub enum TurnResult {
     /// The agent produced a normal assistant message.

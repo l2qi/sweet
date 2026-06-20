@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRisk {
-    /// Read-only — no side effects. Never requires approval.
+    /// Read-only - no side effects. Never requires approval.
     ReadOnly,
     /// Writes to the filesystem but does not run arbitrary commands.
     FileWrite,
@@ -89,7 +89,7 @@ pub fn needs_approval(mode: PermissionMode, risk: ToolRisk) -> bool {
     }
 }
 
-/// The user-meaningful "scope" of a tool call — the bash command, the file
+/// The user-meaningful "scope" of a tool call - the bash command, the file
 /// path being written, etc.
 ///
 /// Used both as the granularity key for session-level ("Always") approvals
@@ -114,7 +114,7 @@ pub fn approval_scope(args: &serde_json::Value) -> String {
 /// enough context to make an informed y/n decision.
 #[derive(Debug, Clone)]
 pub enum ApprovalPreview {
-    /// No rich preview — just show the scope string (default behavior).
+    /// No rich preview - just show the scope string (default behavior).
     None,
     /// A unified diff to show in scrollback before the approval prompt.
     Diff {
@@ -134,7 +134,7 @@ pub enum ApprovalPreview {
 /// handle, so the mode *and* the session approvals survive the switch.
 ///
 /// Deliberately not persisted: "session" here means the current process run,
-/// not a resumable conversation — a resumed session must not silently
+/// not a resumable conversation - a resumed session must not silently
 /// auto-approve dangerous tools.
 #[derive(Debug, Default)]
 pub struct PermissionState {
@@ -242,7 +242,7 @@ mod tests {
         let risks = [ToolRisk::ReadOnly, ToolRisk::FileWrite, ToolRisk::Dangerous];
         for mode in &modes {
             for risk in &risks {
-                // Just ensure no panic — the individual tests assert values.
+                // Just ensure no panic - the individual tests assert values.
                 let _ = needs_approval(*mode, *risk);
             }
         }

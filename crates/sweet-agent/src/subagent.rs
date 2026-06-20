@@ -31,8 +31,8 @@ use sweet_core::tool::{ToolError, ToolHandler, ToolSpec};
 
 /// Default cap on subagent nesting depth when a spec does not set one.
 ///
-/// The value is high enough for the orchestrator(depth 0) → worker(depth 1)
-/// → nested-subagent(depth 2) chain used in headless mode, with slack for
+/// The value is high enough for the orchestrator(depth 0) -> worker(depth 1)
+/// -> nested-subagent(depth 2) chain used in headless mode, with slack for
 /// future nesting.
 pub const DEFAULT_MAX_DEPTH: usize = 5;
 
@@ -80,7 +80,7 @@ impl SubagentSpec {
 
     /// Classify the subagent's risk for the permission system.
     ///
-    /// Defaults to [`ToolRisk::Dangerous`] — the subagent's child agent could
+    /// Defaults to [`ToolRisk::Dangerous`] - the subagent's child agent could
     /// run anything. Read-only investigation subagents should set
     /// [`ToolRisk::ReadOnly`] so they are not gated behind an approval prompt.
     pub fn with_risk(mut self, risk: ToolRisk) -> Self {

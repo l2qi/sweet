@@ -77,7 +77,7 @@ async fn dimension_mismatch_on_reopen_errors() {
         let _store = SqliteVecMemory::open(&path, 2).unwrap();
     }
 
-    // Reopen with 4 dimensions — should error.
+    // Reopen with 4 dimensions - should error.
     let result = SqliteVecMemory::open(&path, 4);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();

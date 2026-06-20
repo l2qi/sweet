@@ -3,8 +3,8 @@
 
 //! End-to-end behavioural tests for the platform sandbox.
 //!
-//! Each test constructs a real [`OsSandbox`] — Seatbelt on macOS, Bubblewrap
-//! on Linux — and exercises both the [`CommandRunner`] (sandboxed `bash`)
+//! Each test constructs a real [`OsSandbox`] - Seatbelt on macOS, Bubblewrap
+//! on Linux - and exercises both the [`CommandRunner`] (sandboxed `bash`)
 //! and the [`Filesystem`] (`RestrictedFs`) interfaces, so we can observe what
 //! the kernel-level enforcement actually denies. Tests skip gracefully if
 //! the platform runner isn't available (e.g. no `bwrap` on a Linux box).
@@ -31,7 +31,7 @@ fn try_harness(policy: SandboxPolicy) -> Option<Harness> {
     let home = PathBuf::from(home);
 
     // Place both trees under $HOME so they aren't in the system read-allow
-    // list (`/tmp`, `/var/folders/...`) — that keeps "outside the project
+    // list (`/tmp`, `/var/folders/...`) - that keeps "outside the project
     // root" actually outside any sandbox-permitted region on macOS.
     let project = TempDir::new_in(&home).ok()?;
     let outside = TempDir::new_in(&home).ok()?;
@@ -303,13 +303,13 @@ async fn network_restricted_blocks_by_default() {
 }
 
 // Note: network policy is fixed at sandbox construction. There is no
-// runtime escape hatch in either backend — a user who restricted network at
+// runtime escape hatch in either backend - a user who restricted network at
 // startup must restart without the deny flag to re-enable it. The two cases
 // above (`network_allow_reaches_internet`, `network_restricted_blocks_by_default`)
 // cover the entire policy surface.
 
 // ---------------------------------------------------------------------------
-// Filesystem (RestrictedFs) — invoked through Sandbox::fs()
+// Filesystem (RestrictedFs) - invoked through Sandbox::fs()
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

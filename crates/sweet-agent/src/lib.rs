@@ -7,7 +7,7 @@
 //! (`Agent`, `run()`), tool dispatch, hook/event dispatch, subagent nesting,
 //! handoff transfers, and command routing. It depends on `sweet-core` for shared
 //! data types (`Message`, `ToolSpec`, `Model` trait, `StreamSink`, etc.) but does
-//! not depend on any LLM provider crate — concrete models are injected at
+//! not depend on any LLM provider crate - concrete models are injected at
 //! construction time by the binary.
 
 pub mod agent;

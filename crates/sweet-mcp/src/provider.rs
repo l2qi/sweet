@@ -55,8 +55,8 @@ type Client = RunningService<rmcp::service::RoleClient, NoopHandler>;
 /// [`specs`]: McpProvider::specs
 pub struct McpProvider {
     tool_specs: Vec<ToolSpec>,
-    /// Held for the provider's lifetime: keeps the MCP session — and, for
-    /// stdio, the child process — alive. Dropping it closes the connection.
+    /// Held for the provider's lifetime: keeps the MCP session - and, for
+    /// stdio, the child process - alive. Dropping it closes the connection.
     #[allow(dead_code)]
     connection: Client,
 }

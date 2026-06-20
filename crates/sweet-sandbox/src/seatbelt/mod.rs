@@ -4,7 +4,7 @@
 //! macOS Seatbelt-based command runner.
 //!
 //! Generates a Seatbelt profile and executes commands via `sandbox-exec(1)`.
-//! Seatbelt is always available on macOS — no external dependencies needed.
+//! Seatbelt is always available on macOS - no external dependencies needed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,14 +38,14 @@ const SYSTEM_READ_PATHS: &[&str] = &[
 /// filesystem and network restrictions.
 ///
 /// Seatbelt is the native macOS sandboxing technology. It uses profiles
-/// (text rules) that are generated per-command. No external tools needed —
+/// (text rules) that are generated per-command. No external tools needed -
 /// `sandbox-exec` ships with every macOS installation.
 pub struct SeatbeltRunner {
     /// Directories allowed for write access.
     allowed_write_roots: Vec<PathBuf>,
     /// Tool directories resolved from `$PATH` and known locations.
     tool_roots: Vec<PathBuf>,
-    /// Policy. Fixed at construction time — macOS SBPL cannot
+    /// Policy. Fixed at construction time - macOS SBPL cannot
     /// filter network by host or IP at the kernel layer (the host token
     /// must be `*` or `localhost`), so per-domain restrictions are not
     /// achievable. The honest model is a one-shot `Sandbox` vs `Restricted`.
@@ -73,7 +73,7 @@ impl SeatbeltRunner {
         // specific (allow ...) below it takes precedence.
         //
         // The (literal "/") rule lets bash read the root directory inode
-        // itself (not its descendants) — libsystem reads it during dyld
+        // itself (not its descendants) - libsystem reads it during dyld
         // initialization and bash aborts with SIGABRT otherwise.
         //
         // (allow sysctl-read) silences the lockdown-mode and bootargs probes
@@ -156,7 +156,7 @@ impl SeatbeltRunner {
         rules.push("(allow process-fork)".to_string());
 
         // Allow sending signals. Without this, processes inside the sandbox
-        // cannot `kill()` their own children — `cargo test`'s test binaries
+        // cannot `kill()` their own children - `cargo test`'s test binaries
         // leak background fixture processes (e.g. sweet-mcp-mock-server) on
         // teardown, which then keep the pipeline's stdout pipe open and hang
         // any consumer reading it.
@@ -282,13 +282,13 @@ mod tests {
 
     /// Check whether we are already inside a Seatbelt sandbox.
     ///
-    /// `sandbox-exec` cannot nest — launching a profile from within an
+    /// `sandbox-exec` cannot nest - launching a profile from within an
     /// existing profile fails with `Operation not permitted`. Tests that
     /// exercise the runner are skipped when this returns `true`.
     fn is_nested_sandbox() -> bool {
         // App Store sandboxed processes get this env var, but command-line
         // `sandbox-exec` profiles do not. Probe by attempting a no-op
-        // sandbox-exec — if it fails, we're already sandboxed.
+        // sandbox-exec - if it fails, we're already sandboxed.
         let output = std::process::Command::new("sandbox-exec")
             .arg("-p")
             .arg("(version 1)(allow default)")

@@ -202,7 +202,7 @@ pub trait Filesystem: Send + Sync {
 ///
 /// Policy is fixed at construction time. Neither platform sandbox
 /// (macOS Seatbelt, Linux bwrap) can filter network traffic by domain or IP
-/// at the kernel layer, so the only honest model is a one-shot decision —
+/// at the kernel layer, so the only honest model is a one-shot decision -
 /// to change it mid-session, the caller restarts.
 pub trait Sandbox: Send + Sync {
     fn runner(&self) -> Arc<dyn CommandRunner>;
@@ -215,7 +215,7 @@ pub trait Sandbox: Send + Sync {
 
 /// Sandbox policy for command execution.
 ///
-/// Set once at startup and fixed for the session — neither macOS Seatbelt
+/// Set once at startup and fixed for the session - neither macOS Seatbelt
 /// nor Linux bwrap can filter network traffic by domain or IP at the kernel
 /// layer, so the only honest model is a one-shot decision. To change policy
 /// mid-session, the caller restarts.

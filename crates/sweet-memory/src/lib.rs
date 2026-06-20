@@ -7,7 +7,7 @@
 //! convenience, and provides:
 //!
 //! - [`SqliteMemory`] (feature `sqlite`): a persistent store with hybrid
-//!   recall — SQLite FTS5 keyword search fused with embedding cosine
+//!   recall - SQLite FTS5 keyword search fused with embedding cosine
 //!   similarity when an [`Embedder`](sweet_core::Embedder) is attached.
 //! - [`SqliteVecMemory`] (feature `sqlite-vec`): like `SqliteMemory` but uses
 //!   `sqlite-vec` for vector similarity search instead of brute-force cosine.
