@@ -14,7 +14,7 @@ pub const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 
 /// [`Embedder`] backed by OpenAI's embeddings endpoint.
 ///
-/// Compatible with any OpenAI-protocol endpoint — point
+/// Compatible with any OpenAI-protocol endpoint - point
 /// [`with_base_url`](Self::with_base_url) at the right URL.
 #[derive(Debug, Clone)]
 pub struct OpenAIEmbedder {

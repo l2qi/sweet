@@ -4,13 +4,13 @@
 //! Long-term memory: durable facts that outlive any single [`Session`](crate::Session).
 //!
 //! A [`Session`](crate::Session) is the transcript of one conversation; a
-//! [`Memory`] is a store of records that persist *across* conversations —
+//! [`Memory`] is a store of records that persist *across* conversations -
 //! user preferences, project facts, distilled decisions. Records carry a
 //! [`MemoryScope`] (who/what they belong to) and are recalled with a
 //! [`MemoryQuery`] (free-text relevance search or scope listing).
 //!
 //! This module defines the vocabulary plus [`EphemeralMemory`], a Vec-backed
-//! implementation mirroring [`InMemorySession`](crate::InMemorySession) —
+//! implementation mirroring [`InMemorySession`](crate::InMemorySession) -
 //! suitable for tests and ephemeral agents. The persistent, searchable
 //! implementation (`SqliteMemory`) lives in the `sweet-memory` crate.
 
@@ -89,7 +89,7 @@ impl std::str::FromStr for MemoryId {
 ///
 /// The key strings are application-defined (a user id, a canonical project
 /// path, a session id). Scopes are chosen by the application when it wires
-/// memory tools and recall — never by the model — so records can't leak
+/// memory tools and recall - never by the model - so records can't leak
 /// across users or projects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MemoryScope {
@@ -202,7 +202,7 @@ impl Default for MemoryQuery {
 
 /// A search result: the record plus its relevance score (higher is better).
 ///
-/// Scores are only comparable within one result set — hybrid backends fuse
+/// Scores are only comparable within one result set - hybrid backends fuse
 /// keyword and vector rankings, so the absolute value carries no unit.
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
@@ -273,7 +273,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Reciprocal Rank Fusion over per-strategy rankings (best first).
 ///
-/// Each id's fused score is `Σ 1/(60 + rank)` across the lists it appears in.
+/// Each id's fused score is `sum of 1/(60 + rank)` across the lists it appears in.
 /// RRF combines keyword and vector rankings without having to normalize
 /// incomparable score scales (bm25 vs cosine). Returns ids best-first.
 pub fn rrf_merge(rankings: &[Vec<MemoryId>]) -> Vec<(MemoryId, f32)> {
@@ -302,7 +302,7 @@ struct EphemeralEntry {
 ///
 /// Keyword recall uses token-overlap scoring; with an [`Embedder`] attached,
 /// cosine similarity over embedded records is fused in via [`rrf_merge`].
-/// Nothing survives the process — use `SqliteMemory` from `sweet-memory`
+/// Nothing survives the process - use `SqliteMemory` from `sweet-memory`
 /// for persistence.
 pub struct EphemeralMemory {
     entries: Mutex<Vec<EphemeralEntry>>,

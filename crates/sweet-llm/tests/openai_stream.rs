@@ -168,7 +168,7 @@ async fn complete_stream_handles_split_byte_chunks() {
     // Verify that an event whose bytes arrive across multiple TCP chunks is
     // still parsed correctly. Wiremock returns the body in one chunk by
     // default, so we instead split at the SSE boundary by interleaving an
-    // empty event — proves the buffer state machine handles multi-event
+    // empty event - proves the buffer state machine handles multi-event
     // bodies.
     let server = MockServer::start().await;
     let body = sse_body(&[
@@ -274,7 +274,7 @@ async fn complete_stream_preserves_explicit_empty_reasoning_content() {
     // Kimi/DeepSeek can stream `reasoning_content: ""` to signal "explicit
     // empty" (no chain-of-thought this turn but the field is present). The
     // streamed Message must round-trip that as a single empty-text block so
-    // the next outgoing request re-emits `reasoning_content: ""` — matches
+    // the next outgoing request re-emits `reasoning_content: ""` - matches
     // the non-streaming TryFrom path.
     let server = MockServer::start().await;
 

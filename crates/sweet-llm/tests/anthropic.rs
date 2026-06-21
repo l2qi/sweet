@@ -10,7 +10,7 @@ use serial_test::serial;
 use sweet_core::message::ToolCall;
 use sweet_core::stream::StreamSink;
 use sweet_core::{Message, Model, ToolError, ToolHandler, ToolSpec};
-use sweet_llm::{anthropic, AnthropicProvider, ProviderError};
+use sweet_llm::{anthropic, AnthropicProvider, ProviderError, ReasoningConfig};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -78,7 +78,9 @@ async fn complete_posts_correct_request_and_returns_assistant_message() {
 
     let provider = AnthropicProvider::new("test-key")
         .with_base_url(server.uri())
-        .with_model("claude-test");
+        .with_model("claude-test")
+        // Assert the base request shape; caching is covered separately.
+        .with_prompt_caching(false);
 
     let reply = provider
         .complete(&[Message::system("be terse"), Message::user("hello")], &[])
@@ -430,7 +432,10 @@ async fn complete_with_thinking_enabled_sends_thinking_field_and_captures_thinki
 
     let provider = AnthropicProvider::new("k")
         .with_base_url(server.uri())
-        .with_thinking(anthropic::ThinkingConfig::enabled(10000));
+        // max_tokens is the output ceiling the budget is carved from; set it
+        // above the budget so the `budget_tokens < max_tokens` clamp keeps 10000.
+        .with_max_tokens(64_000)
+        .with_reasoning(ReasoningConfig::Budget(10000));
 
     let reply = provider
         .complete(&[Message::user("what is 6*7?")], &[])
@@ -477,7 +482,8 @@ async fn complete_with_adaptive_thinking_sends_adaptive_field() {
 
     let provider = AnthropicProvider::new("k")
         .with_base_url(server.uri())
-        .with_thinking(anthropic::ThinkingConfig::adaptive());
+        // `Toggle(true)` maps to adaptive thinking; no model name is sniffed.
+        .with_reasoning(ReasoningConfig::Toggle(true));
 
     let reply = provider
         .complete(&[Message::user("hi")], &[])
@@ -525,7 +531,7 @@ async fn complete_stream_with_thinking_emits_thinking_deltas_and_captures_thinki
 
     let provider = AnthropicProvider::new("k")
         .with_base_url(server.uri())
-        .with_thinking(anthropic::ThinkingConfig::enabled(5000));
+        .with_reasoning(ReasoningConfig::Budget(5000));
 
     let mut sink = CapturingSink::new();
     let reply = provider
@@ -544,6 +550,49 @@ async fn complete_stream_with_thinking_emits_thinking_deltas_and_captures_thinki
     assert_eq!(sink.deltas(), vec!["Answer: 42"]);
 }
 
+/// Streaming must fold the cache read/write totals from `message_start` into the
+/// reported context size, matching the non-streaming path. Anthropic reports
+/// `input_tokens` as the *uncached* portion only, so with prompt caching on (the
+/// default) the bulk of the prompt arrives as `cache_read_input_tokens`; dropping
+/// it would massively undercount the context and stall compaction.
+#[tokio::test]
+async fn complete_stream_includes_cache_tokens_in_context_size() {
+    let server = MockServer::start().await;
+
+    let body = sse_body(&[
+        r#"{"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":700,"output_tokens":0}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":20}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]);
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new("k").with_base_url(server.uri());
+
+    let mut sink = CapturingSink::new();
+    let reply = provider
+        .complete_stream(&[Message::user("hi")], &[], &mut sink)
+        .await
+        .unwrap();
+
+    // context = 10 (uncached) + 200 (cache write) + 700 (cache read) = 910.
+    assert_eq!(reply.context_tokens, Some(910));
+    // token_count = context + output = 910 + 20 = 930.
+    assert_eq!(reply.token_count, Some(930));
+}
+
 /// Multi-turn thinking: signatures ride along on `Message.thinking_content`,
 /// so a previous turn's thinking block is re-emitted verbatim when the
 /// caller passes the prior assistant `Message` back into `complete`.
@@ -551,7 +600,7 @@ async fn complete_stream_with_thinking_emits_thinking_deltas_and_captures_thinki
 async fn complete_round_trips_thinking_blocks_in_multi_turn() {
     let server = MockServer::start().await;
 
-    // Each mock matches one call (FIFO) — assertion happens after the fact
+    // Each mock matches one call (FIFO) - assertion happens after the fact
     // against `received_requests`, so mock routing stays independent of body
     // shape.
     Mock::given(method("POST"))
@@ -594,7 +643,9 @@ async fn complete_round_trips_thinking_blocks_in_multi_turn() {
 
     let provider = AnthropicProvider::new("k")
         .with_base_url(server.uri())
-        .with_thinking(anthropic::ThinkingConfig::enabled(10000));
+        .with_reasoning(ReasoningConfig::Budget(10000))
+        // Multi-turn shape assertions; caching is covered separately.
+        .with_prompt_caching(false);
 
     let first_reply = provider
         .complete(&[Message::user("first")], &[])
@@ -663,9 +714,48 @@ async fn complete_round_trips_thinking_blocks_in_multi_turn() {
 }
 
 #[test]
-fn with_thinking_configures_provider() {
-    let _ = AnthropicProvider::new("k").with_thinking(anthropic::ThinkingConfig::enabled(8000));
-    let _ = AnthropicProvider::new("k").with_thinking(anthropic::ThinkingConfig::adaptive());
+fn with_reasoning_configures_provider() {
+    let _ = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Budget(8000));
+    let _ = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Toggle(true));
+    let _ = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Toggle(false));
+    let _ = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Effort("high".to_string()));
+}
+
+#[tokio::test]
+async fn prompt_caching_on_by_default_sets_cache_control() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_partial_json(serde_json::json!({
+            "system": [
+                {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "m",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 5}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Caching is on by default - no `with_prompt_caching` call.
+    let provider = AnthropicProvider::new("k").with_base_url(server.uri());
+    provider
+        .complete(&[Message::system("be terse"), Message::user("hi")], &[])
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------

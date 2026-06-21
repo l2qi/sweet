@@ -246,7 +246,7 @@ impl ToolHandler for UpdateHandler {
 pub fn memory_update_tool(toolset: MemoryToolset) -> ToolSpec {
     ToolSpec::new(
         "memory_update",
-        "Update an existing memory when it is outdated or imprecise — prefer this \
+        "Update an existing memory when it is outdated or imprecise - prefer this \
          over saving a near-duplicate. Takes the id returned by memory_search or \
          memory_save.",
         json!({

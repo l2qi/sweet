@@ -92,7 +92,7 @@ impl RestrictedFs {
         );
 
         // Safe individual config files (e.g. ~/.gitconfig). These are exact
-        // file paths — Path::starts_with is component-aware, so
+        // file paths - Path::starts_with is component-aware, so
         // /home/user/.gitconfig_backup does NOT match /home/user/.gitconfig.
         read_roots.extend(
             tool_paths::resolve_safe_config_files()
@@ -122,7 +122,7 @@ impl RestrictedFs {
     ///
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)
     /// to keep out of the resolved tool roots, on top of the built-in
-    /// credential directories — see `tool_paths::resolve_tool_roots`.
+    /// credential directories - see `tool_paths::resolve_tool_roots`.
     pub fn with_local_fs_and_reads(
         project_root: PathBuf,
         extra_read_roots: Vec<PathBuf>,
@@ -324,7 +324,7 @@ mod tests {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
             let canonical_root = dunce::canonicalize(root.path()).unwrap();
-            // No extra read roots — only system paths + project root
+            // No extra read roots - only system paths + project root
             let fs = RestrictedFs::new(Arc::new(DirectFs), vec![canonical_root], vec![]);
             Self { _root: root, fs }
         }

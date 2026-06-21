@@ -4,8 +4,8 @@
 //! Turnkey long-term memory wiring for agents.
 //!
 //! Two independent pieces, both working against the [`Memory`] trait from
-//! `sweet-core` (so any store — `EphemeralMemory`, `SqliteMemory` from
-//! `sweet-memory`, or a custom backend — plugs in):
+//! `sweet-core` (so any store - `EphemeralMemory`, `SqliteMemory` from
+//! `sweet-memory`, or a custom backend - plugs in):
 //!
 //! - **Recall**: [`MemoryRecall`] renders relevant memories into the system
 //!   instructions every turn via [`DynamicPrompt`], and
@@ -21,7 +21,7 @@
 //!   synchronously, then run [`MemoryDistiller::distill_span`] from a
 //!   background task.
 //!
-//! Wire both only on top-level agents — an ephemeral subagent session should
+//! Wire both only on top-level agents - an ephemeral subagent session should
 //! not distill into long-term memory.
 
 use std::sync::{Arc, Mutex};
@@ -141,7 +141,7 @@ impl ProcedureHandler for MemoryRecallProcedure {
             return Ok(());
         };
         // A recall failure (e.g. an embedding endpoint hiccup) must not fail
-        // the user's turn — the agent just proceeds without fresh recall.
+        // the user's turn - the agent just proceeds without fresh recall.
         if let Err(err) = self.recall.refresh(&text).await {
             tracing::warn!("memory recall failed: {err}");
         }
@@ -169,7 +169,7 @@ pub struct DistillConfig {
     /// since the last pass (gates the extra model call).
     pub min_new_items: usize,
     /// Skip saving a candidate whose token overlap with its nearest existing
-    /// memory reaches this Jaccard similarity (0.0–1.0).
+    /// memory reaches this Jaccard similarity (0.0-1.0).
     pub dedup_threshold: f32,
     /// Per-item character cap when rendering the transcript for the distill
     /// prompt (keeps huge tool results from blowing up the call).
@@ -204,12 +204,12 @@ struct DistillItem {
 /// - The `AfterTurn` procedure from [`memory_distill_capabilities`], which
 ///   applies the cadence gate in-turn (fine for non-interactive agents; it
 ///   runs a model call before the turn returns).
-/// - [`run_now`](Self::run_now) at natural boundaries — session rotation,
-///   clean exit — to flush a span that hasn't reached the cadence yet.
+/// - [`run_now`](Self::run_now) at natural boundaries - session rotation,
+///   clean exit - to flush a span that hasn't reached the cadence yet.
 /// - Off the critical path: hold an `Arc<MemoryDistiller>` (see
 ///   [`memory_distiller_capabilities`]), [`claim_span`](Self::claim_span)
 ///   synchronously, then run [`distill_span`](Self::distill_span) from a
-///   background task with a snapshot of the items and the model — so an
+///   background task with a snapshot of the items and the model - so an
 ///   interactive UI never waits on the distill model call.
 ///
 /// The watermark is shared across all paths, so the same items are never
@@ -253,7 +253,7 @@ impl MemoryDistiller {
     /// Claim the undistilled span as a [`SpanClaim`], or `None` when fewer
     /// than `min_items` new items have accumulated.
     ///
-    /// Advances the watermark immediately — claim *before* spawning a
+    /// Advances the watermark immediately - claim *before* spawning a
     /// background [`distill_span`](Self::distill_span) so concurrent paths
     /// can't double-claim, and a span that fails to distill is skipped, not
     /// retried every turn. The returned claim is the only way to call
@@ -274,13 +274,13 @@ impl MemoryDistiller {
     }
 
     /// Distill whatever is undistilled right now, ignoring the cadence gate.
-    /// Failures are logged, never returned — same contract as the hook path.
+    /// Failures are logged, never returned - same contract as the hook path.
     pub async fn run_now(&self, ctx: &mut dyn CommandContext) {
         self.run_with_ctx(ctx, 1).await;
     }
 
     /// Claim with `min_items`, then distill using the context's model and
-    /// session — the shared body of the in-turn paths.
+    /// session - the shared body of the in-turn paths.
     async fn run_with_ctx(&self, ctx: &mut dyn CommandContext, min_items: usize) {
         let items = ctx.session().items().to_vec();
         let Some(claim) = self.claim_span(items.len(), min_items) else {
@@ -351,7 +351,7 @@ impl MemoryDistiller {
     ///
     /// Takes a `claim` (from [`claim_span`](Self::claim_span)) and the full
     /// item snapshot rather than a `CommandContext`, so it can run detached
-    /// from the agent — claiming on the turn thread, distilling off it.
+    /// from the agent - claiming on the turn thread, distilling off it.
     /// `items` must be the session snapshot the claim was made against;
     /// `source_session` is recorded as provenance on saves.
     pub async fn distill_span(
@@ -363,7 +363,7 @@ impl MemoryDistiller {
     ) -> std::result::Result<DistillReport, DistillError> {
         let mut report = DistillReport::default();
         // `items` must be the snapshot the claim was made against. A shorter
-        // slice (a violated contract — e.g. a stale snapshot after compaction)
+        // slice (a violated contract - e.g. a stale snapshot after compaction)
         // has nothing at the claimed start: surface it rather than silently
         // distilling an empty span.
         let Some(span) = items.get(claim.start..) else {
@@ -420,7 +420,7 @@ impl MemoryDistiller {
              \n\
              Rules:\n\
              - Output ONLY a JSON array.\n\
-             - New memory: {{\"content\": \"...\", \"tags\": [\"...\"]}} — one \
+             - New memory: {{\"content\": \"...\", \"tags\": [\"...\"]}} - one \
              self-contained fact per entry, phrased to make sense without this \
              conversation.\n\
              - An EXISTING memory that is now outdated: {{\"id\": \"<its id>\", \
@@ -453,7 +453,7 @@ impl MemoryDistiller {
                     };
                     // The id is model-produced; only records in this
                     // distiller's scope may be rewritten (mirroring
-                    // MemoryToolset's scope enforcement — recall can render
+                    // MemoryToolset's scope enforcement - recall can render
                     // ids from other scopes into the model's context).
                     match self.store.get(&id).await {
                         Ok(Some(record)) if record.scope == self.scope => {
@@ -519,7 +519,7 @@ impl MemoryDistiller {
 /// Capabilities that distill durable facts from the transcript into `store`
 /// after turns, every `config.min_new_items` of session growth.
 ///
-/// `scope` is where new memories land. Wire this on top-level agents only —
+/// `scope` is where new memories land. Wire this on top-level agents only -
 /// subagent scratch sessions should not write long-term memory.
 pub fn memory_distill_capabilities(
     store: Arc<dyn Memory>,
@@ -568,7 +568,7 @@ fn render_transcript(span: &[MemoryItem], max_chars_per_item: usize) -> String {
 /// prose around it.
 /// The first substring that parses as a JSON array: each `[` is tried in
 /// order, with serde finding the array's true end. Tolerates markdown fences
-/// and prose around the array — including prose containing brackets, which a
+/// and prose around the array - including prose containing brackets, which a
 /// greedy first-`[`-to-last-`]` span would swallow.
 fn extract_json_array(text: &str) -> Option<&str> {
     let mut from = 0;
@@ -957,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn distill_span_skips_when_items_shorter_than_claim() {
         let store: Arc<dyn Memory> = Arc::new(EphemeralMemory::new());
-        // Empty script: were the model called, this would error — so reaching
+        // Empty script: were the model called, this would error - so reaching
         // Ok proves the guard returns before the model call.
         let model = MockModel::with_replies(Vec::<&str>::new());
         let distiller = MemoryDistiller::new(store, scope(), DistillConfig::default());
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(extract_json_array("there are [no memories]. done."), None);
         // Prose brackets after the array must not extend the span.
         assert_eq!(
-            extract_json_array("[{\"a\":1}] — saved [1 item]"),
+            extract_json_array("[{\"a\":1}] - saved [1 item]"),
             Some("[{\"a\":1}]")
         );
         // Prose brackets before the array must not start the span.

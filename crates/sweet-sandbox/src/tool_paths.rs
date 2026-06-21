@@ -66,12 +66,12 @@ const SAFE_HOME_CONFIG_FILES: &[&str] = &[".gitconfig", ".gitignore_global"];
 /// Resolve all tool directories that should be readable inside the sandbox.
 ///
 /// Sources:
-/// 1. Parent directories of every entry in `$PATH` (e.g. `~/.cargo/bin` → `~/.cargo`)
+/// 1. Parent directories of every entry in `$PATH` (e.g. `~/.cargo/bin` -> `~/.cargo`)
 /// 2. Known tool directories under the home directory (e.g. `~/.rustup`, `~/.local`)
 ///
-/// Excludes credential directories — the built-in `SECRET_DIRS` plus any
+/// Excludes credential directories - the built-in `SECRET_DIRS` plus any
 /// home-relative paths in `extra_secret_dirs` (e.g. `".myapp"`) that the
-/// caller wants kept out of the sandbox — and deduplicates.
+/// caller wants kept out of the sandbox - and deduplicates.
 pub fn resolve_tool_roots(extra_secret_dirs: &[String]) -> Vec<PathBuf> {
     let Some(home) = home_dir() else {
         return Vec::new();
@@ -79,7 +79,7 @@ pub fn resolve_tool_roots(extra_secret_dirs: &[String]) -> Vec<PathBuf> {
 
     let mut roots: Vec<PathBuf> = Vec::new();
 
-    // 1. $PATH entries — add the parent directory of each entry
+    // 1. $PATH entries - add the parent directory of each entry
     if let Ok(path_var) = std::env::var("PATH") {
         for entry in std::env::split_paths(&path_var) {
             if let Some(parent) = entry.parent() {
@@ -109,13 +109,13 @@ pub fn resolve_tool_roots(extra_secret_dirs: &[String]) -> Vec<PathBuf> {
     // A tool root is unsafe if re-exposing it would defeat the sandbox's
     // home-directory isolation. That means rejecting:
     //
-    //   (a) `/` and any other ancestor of home — re-mounting these on
+    //   (a) `/` and any other ancestor of home - re-mounting these on
     //       Linux clobbers the `--tmpfs $HOME` overlay, and on macOS grants
     //       blanket read access. `/bin` and `/sbin` are in nearly every
     //       PATH, so their parent (`/`) lands here without this guard.
-    //   (b) Home itself — same reasoning.
+    //   (b) Home itself - same reasoning.
     //   (c) The secret dirs themselves and anything under them.
-    //   (d) Paths that *contain* a secret dir — re-mounting them would
+    //   (d) Paths that *contain* a secret dir - re-mounting them would
     //       transitively re-expose `~/.ssh`, `~/.aws`, etc.
     let secret_canonical: Vec<PathBuf> = SECRET_DIRS
         .iter()
@@ -151,7 +151,7 @@ pub fn resolve_tool_roots(extra_secret_dirs: &[String]) -> Vec<PathBuf> {
 
 /// Resolve individual config files from the home directory that are safe to expose.
 ///
-/// Unlike tool roots (directories), these are specific files — only the
+/// Unlike tool roots (directories), these are specific files - only the
 /// file itself is readable, not its parent directory. Used by Seatbelt
 /// `(literal ...)` rules and bwrap `--ro-bind` for individual files.
 pub fn resolve_safe_config_files() -> Vec<PathBuf> {
@@ -244,7 +244,7 @@ mod tests {
     /// Regression: `/bin` and `/sbin` are in nearly every PATH, and their
     /// parent is `/`. If `/` leaks into tool_roots, the bubblewrap runner
     /// re-binds `/` on top of `--tmpfs $HOME` and the entire home directory
-    /// becomes visible again. RestrictedFs hits the same bug — `/` in the
+    /// becomes visible again. RestrictedFs hits the same bug - `/` in the
     /// read-roots list means every path passes the read check.
     #[test]
     fn resolve_excludes_filesystem_root() {

@@ -14,6 +14,7 @@ Sweet is an async, trait-based AI agent framework for Rust. It provides:
 - **Long-term memory** (`sweet-memory`): SQLite store with hybrid FTS5 + embedding recall, memory tools
 - **OS sandboxing** (`sweet-sandbox`): macOS Seatbelt, Linux Bubblewrap
 - **MCP integration** (`sweet-mcp`): MCP tool provider via the `rmcp` SDK
+- **Computer use** (`sweet-computer-use-core`, `sweet-computer-use-macos`): a platform-neutral GUI-action vocabulary, a provider trait, and the `computer` tool; a macOS backend over the accessibility tree, Quartz events, and screen capture
 
 Dependency direction (one-way — never reverse):
 ```
@@ -24,6 +25,8 @@ sweet-session  → sweet-core
 sweet-memory   → sweet-core
 sweet-tools    → sweet-core (with "derive" feature)
 sweet-sandbox  → sweet-core
+sweet-computer-use-core     → sweet-core
+sweet-computer-use-macos    → sweet-computer-use-core, sweet-core (CommandRunner for open_app; macOS FFI is standalone)
 sweet-tool-derive → (standalone proc-macro, no sweet deps)
 sweet-mcp-mock-server → rmcp (test fixture only)
 ```
@@ -85,8 +88,8 @@ Anti-patterns to avoid:
 
 ### Providers
 
-- Wire-protocol provider implementations live in `sweet-llm`: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider` — one per protocol.
-- An OpenAI-wire-compatible endpoint (Cerebras, OpenRouter, etc.) is `OpenAIProvider` preconfigured with a base URL — not a new provider. Such newtypes belong next to their consumer, not in `sweet-llm`.
+- Wire-protocol provider implementations live in `sweet-llm`: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `CerebrasProvider` — one per protocol (or protocol-plus-reasoning-dialect).
+- An OpenAI-wire-compatible endpoint (OpenRouter, a local llama server, etc.) with no reasoning quirks is `OpenAIProvider` preconfigured with a base URL — not a new provider; such newtypes belong next to their consumer, not in `sweet-llm`. The exception is when the endpoint diverges on *reasoning* semantics beyond a base URL: `CerebrasProvider` earns its own dedicated provider because it rejects the `thinking` object, uses `reasoning` (not `reasoning_content`) as the history key, and is effort-only — divergences that cannot be expressed by composition alone. A provider whose only difference is the base URL never earns a dedicated provider.
 - If the new protocol is genuinely different, create `src/<protocol>/mod.rs` and `src/<protocol>/wire.rs` (private serde DTOs in `wire.rs`).
 - Gate every provider behind its own Cargo feature. Add `#[cfg(feature = "...")]` to the module declaration in `lib.rs` and `#![cfg(feature = "...")]` at the top of its integration test file.
 - Follow the `DEFAULT_BASE_URL`, `DEFAULT_API_KEY_ENV`, `DEFAULT_MODEL` constant naming convention.
@@ -185,17 +188,17 @@ Feature flags:
 
 ### sweet-llm
 
-Public surface: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `OpenAIEmbedder`, `GeminiEmbedder`, `ProviderError`. Per-provider thinking config: `openai::ThinkingMode`, `openai::ReasoningContent`, `anthropic::ThinkingConfig`.
+Public surface: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `CerebrasProvider`, `OpenAIEmbedder`, `GeminiEmbedder`, `ReasoningConfig`, `SamplingConfig`, `ToolChoice`, `StructuredOutput`, `ProviderError`. Reasoning is configured via the cross-provider `ReasoningConfig` (Toggle/Effort/Budget); each provider's `with_reasoning` maps each variant to a single wire shape. **The provider never sniffs the model name** - where a model family needs a different wire encoding, the caller (which owns the catalog) expresses it by choosing the variant: Anthropic `Toggle(true)` -> `{type: adaptive}` (Claude 4.6+) while older models take an explicit `Budget`; Gemini `Effort` -> `thinkingLevel` (Gemini 3+) while 2.5 takes a `Budget`.
 
-- `OpenAIProvider` supports thinking-mode models via OpenAI-compatible wire format.
-- `AnthropicProvider` supports native thinking blocks; configure with `AnthropicProvider::with_thinking(ThinkingConfig)`.
-- Embedders follow the provider builder pattern (`new`, `from_env`, `with_base_url`, `with_model`). No Anthropic embedder — Anthropic has no embeddings API (their docs point at Voyage AI).
+- `OpenAIProvider` exposes reasoning via `reasoning_effort` and a `thinking` object (`with_reasoning`); `openai::ReasoningContent` is the reasoning-history replay abstraction.
+- `AnthropicProvider` supports native thinking blocks; configure reasoning with `with_reasoning`.
+- Embedders follow the provider builder pattern (`new`, `from_env`, `with_base_url`, `with_model`). No Anthropic embedder - Anthropic has no embeddings API (their docs point at Voyage AI).
 
 Feature flags:
 
 | Flag | Pulls in |
 |------|---------|
-| `openai` | `OpenAIProvider`, `OpenAIEmbedder` |
+| `openai` | `OpenAIProvider`, `OpenAIEmbedder`, `CerebrasProvider` |
 | `gemini` | `GeminiProvider`, `GeminiEmbedder` |
 | `anthropic` | `AnthropicProvider` |
 | (default) | all of the above |
@@ -255,6 +258,31 @@ Feature flags:
 ### sweet-mcp-mock-server
 
 Test-fixture binary (`publish = false`). Exposes `echo` and `add` tools over stdio and Streamable HTTP. Not shipped — built only during CI as a hermetic test dependency.
+
+### sweet-computer-use-core
+
+Platform-neutral computer-use substrate. Defines the bounded `ComputerAction` set a model can request, the structured `ComputerObservation` a platform reports back, the `ComputerUseProvider` trait a backend implements, and the single model-facing `computer_use_tool` that bridges the two. It knows nothing about macOS, Quartz, or accessibility APIs - that lives behind the provider trait.
+
+Public surface: `ComputerAction`, `MouseButton`, `Point`, `ActionOutcome`, `ComputerObservation`, `ObserveOptions`, `PixelRect`, `Rect`, `Screenshot`, `Size`, `UiNode`, `WindowInfo`, `crosshair_rects`, `render_observation`, `render_outcome`, `ComputerUseError`, `ComputerUseProvider`, `SharedProvider`, `computer_use_tool`, `CoordinateSpace`, `COMPUTER_TOOL_NAME`.
+
+- Observations are text-first (active app, window list, accessibility tree with exact frames) with an optional screenshot attached as an image block via `ToolOutput` (`call_rich`). The `Observe` and `Screenshot` actions are routed to `observe`; every other variant goes to `act`.
+- Coordinate mapping is owned by the harness, not the model: `CoordinateSpace` (`Absolute` or `Normalized { grid }`) maps model coordinates to display pixels, and coordinates are clamped on-screen in both spaces.
+- No Cargo features.
+
+### sweet-computer-use-macos
+
+macOS backend implementing `ComputerUseProvider`. Talks directly to the platform C APIs via hand-written `extern "C"` FFI (`macos::ffi`), linked in `build.rs`:
+
+- Accessibility (`AXUIElement`, ApplicationServices): the focused window's element tree, plus `AXPress`/`AXValue` actions.
+- Quartz Event Services (`CGEvent`, CoreGraphics): synthetic mouse, keyboard, and scroll input.
+- CoreGraphics display + window list, and ImageIO PNG screen capture.
+
+Public surface: `MacComputerUse`.
+
+- Everything platform-specific is `#[cfg(target_os = "macos")]`; on other targets the crate still builds and `MacComputerUse` reports `ComputerUseError::Unsupported`.
+- Observing the accessibility tree and posting synthetic input require the **Accessibility** TCC grant; screen capture requires **Screen Recording**. Missing grants fail with `ComputerUseError::PermissionDenied` naming the System Settings pane.
+- `Wait` is resolved in the async provider via `tokio::time::sleep` (non-blocking); `open_app` goes through the injected `CommandRunner` (`DirectRunner` by default, overridable via `with_command_runner`) with the model-controlled app name shell-quoted to prevent injection.
+- No Cargo features.
 
 ## What to update when you change things
 

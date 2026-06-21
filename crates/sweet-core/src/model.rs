@@ -25,7 +25,7 @@ pub trait Model: Send + Sync {
     /// Providers that support server-side streaming should override this and
     /// emit content deltas plus completed tool calls to `sink` as they arrive.
     /// The default implementation calls [`Model::complete`] and emits the full
-    /// reply as a single delta — fine for tests and providers without
+    /// reply as a single delta - fine for tests and providers without
     /// streaming support.
     async fn complete_stream(
         &self,

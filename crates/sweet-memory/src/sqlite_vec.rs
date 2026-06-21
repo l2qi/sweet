@@ -58,7 +58,7 @@ fn ensure_vec_extension_loaded() {
 /// Rank Fusion.
 ///
 /// The vector dimensionality is fixed at store creation time and persisted in
-/// a `_meta` table. Reopening with a different dimensionality is an error —
+/// a `_meta` table. Reopening with a different dimensionality is an error -
 /// you would need to create a new database or re-embed everything.
 ///
 /// Opens in WAL mode with a busy timeout so multiple processes can share the
@@ -83,7 +83,7 @@ impl SqliteVecMemory {
     /// Open (or create) the store at `path` with the given vector
     /// dimensionality. Pass `":memory:"` for a transient store.
     ///
-    /// The dimensionality must match across reopens — it is validated against
+    /// The dimensionality must match across reopens - it is validated against
     /// the `_meta` table on subsequent opens. The attached embedder must
     /// produce vectors of exactly this size; other sizes degrade to
     /// keyword-only recall (see [`with_embedder`](Self::with_embedder)).
@@ -102,8 +102,8 @@ impl SqliteVecMemory {
     }
 
     /// Attach an embedder; subsequent saves are embedded and searches add a
-    /// semantic ranking. Embedding failure during save — including vectors
-    /// whose size doesn't match the store's dimensionality — degrades that
+    /// semantic ranking. Embedding failure during save - including vectors
+    /// whose size doesn't match the store's dimensionality - degrades that
     /// record to keyword-only recall rather than failing the save.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
@@ -167,7 +167,7 @@ impl SqliteVecMemory {
 
     /// Embed `text` if an embedder is attached; `None` (with a warning) when
     /// embedding fails or the vector doesn't match the store's
-    /// dimensionality — memory durability beats vector coverage.
+    /// dimensionality - memory durability beats vector coverage.
     async fn try_embed(&self, text: &str) -> Option<Vec<f32>> {
         let embedder = self.embedder.as_ref()?;
         match embedder.embed(&[text.to_string()]).await {
@@ -202,7 +202,7 @@ impl SqliteVecMemory {
     /// normalized vectors (most embedding models output unit vectors), L2
     /// distance and cosine similarity produce identical rankings.
     ///
-    /// sqlite-vec requires the LIMIT to be directly on the vec0 scan —
+    /// sqlite-vec requires the LIMIT to be directly on the vec0 scan -
     /// additional WHERE filters break the KNN plan. So we do the KNN query
     /// first with just the MATCH + k, then filter by embedder model,
     /// scope, and tags in Rust.
@@ -215,7 +215,7 @@ impl SqliteVecMemory {
         let query_blob = vec_to_blob(query_vector);
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
-        // KNN query — using `k = N` for broad SQLite compatibility.
+        // KNN query - using `k = N` for broad SQLite compatibility.
         let sql = format!(
             "SELECT {RECORD_COLUMNS_QUALIFIED}, memories.embedding_model
              FROM memories_vec v

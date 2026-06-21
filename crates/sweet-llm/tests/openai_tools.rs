@@ -153,5 +153,7 @@ async fn complete_serializes_tool_result_messages() {
         .await
         .expect("complete should succeed");
 
-    assert_eq!(reply, Message::assistant("done"));
+    let mut expected = Message::assistant("done");
+    expected.finish_reason = Some(sweet_core::FinishReason::Stop);
+    assert_eq!(reply, expected);
 }

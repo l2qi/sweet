@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::error::ProviderError;
 
 /// Convert a [`sweet_core::Error`] from a stream-sink callback into a
-/// [`ProviderError`]. The sink only fails if the IO layer does — surface the
+/// [`ProviderError`]. The sink only fails if the IO layer does - surface the
 /// message.
 pub(crate) fn provider_error_from_core(err: sweet_core::Error) -> ProviderError {
     ProviderError::Decode(serde::de::Error::custom(err.to_string()))

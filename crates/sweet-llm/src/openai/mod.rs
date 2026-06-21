@@ -4,14 +4,17 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use futures_util::StreamExt;
-use sweet_core::message::{Role, ToolCall};
+use serde_json::Value;
+use sweet_core::message::{ContentBlock, Role, ToolCall};
 use sweet_core::stream::StreamSink;
 use sweet_core::{Message, Model, Result, ToolSpec, SWEET_VERSION};
 
 use crate::error::ProviderError;
 use crate::schema::sanitize_schema;
 use crate::util::{elapsed_ms, json_string, provider_error_from_core};
+use crate::{ReasoningConfig, SamplingConfig, StructuredOutput, ToolChoice};
 
 mod embeddings;
 pub use embeddings::{OpenAIEmbedder, DEFAULT_EMBEDDING_MODEL};
@@ -19,11 +22,11 @@ pub use embeddings::{OpenAIEmbedder, DEFAULT_EMBEDDING_MODEL};
 mod reasoning;
 pub use reasoning::ReasoningContent;
 
-mod thinking;
-pub use thinking::ThinkingMode;
-
 mod wire;
-use wire::{ChatRequest, StreamChunk, StreamOptions, WireMessage, WireTool, WireToolFunction};
+use wire::{
+    ChatRequest, StreamChunk, StreamOptions, WireContent, WireContentPart, WireImageUrl,
+    WireMessage, WireTool, WireToolFunction,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_API_KEY_ENV: &str = "OPENAI_API_KEY";
@@ -32,7 +35,7 @@ pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 /// Inference provider for OpenAI's `/v1/chat/completions` API.
 ///
 /// Compatible with any OpenAI-protocol endpoint (Cerebras, local llama
-/// servers, etc.) — point [`OpenAIProvider::with_base_url`] at the right URL.
+/// servers, etc.) - point [`OpenAIProvider::with_base_url`] at the right URL.
 #[derive(Debug, Clone)]
 pub struct OpenAIProvider {
     http: reqwest::Client,
@@ -42,7 +45,33 @@ pub struct OpenAIProvider {
     context_window: Option<usize>,
     user_agent: String,
     reasoning_effort: Option<String>,
-    thinking: Option<ThinkingMode>,
+    thinking: Option<ThinkingState>,
+    reasoning_history_key: ReasoningHistoryKey,
+    sampling: SamplingConfig,
+    tool_choice: Option<ToolChoice>,
+    structured_output: Option<StructuredOutput>,
+}
+
+/// Which wire field carries replayed assistant reasoning history. Most
+/// OpenAI-compatible backends read `reasoning_content`; Cerebras expects
+/// `reasoning` (it renames the field server-side otherwise).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReasoningHistoryKey {
+    ReasoningContent,
+    Reasoning,
+}
+
+/// Internal state for the OpenAI-compatible `thinking` object. Built via
+/// [`OpenAIProvider::with_reasoning`] / [`OpenAIProvider::with_preserved_reasoning_history`]
+/// and rendered to the wire by [`OpenAIProvider::thinking_config`].
+#[derive(Debug, Clone, Copy)]
+struct ThinkingState {
+    /// `thinking.type` - `enabled` vs `disabled`.
+    enabled: bool,
+    /// `thinking.keep = "all"` - Kimi-specific history preservation.
+    preserve_history: bool,
+    /// `thinking.budget_tokens` - token budget for the reasoning pass.
+    budget_tokens: Option<u32>,
 }
 
 impl OpenAIProvider {
@@ -58,7 +87,74 @@ impl OpenAIProvider {
             user_agent: format!("sweet/{}", SWEET_VERSION),
             reasoning_effort: None,
             thinking: None,
+            reasoning_history_key: ReasoningHistoryKey::ReasoningContent,
+            sampling: SamplingConfig::default(),
+            tool_choice: None,
+            structured_output: None,
         }
+    }
+
+    /// Constrain how the model chooses among tools. Only sent when the request
+    /// carries tools.
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+
+    /// Constrain the response to JSON matching a schema (`response_format`).
+    pub fn with_structured_output(mut self, output: StructuredOutput) -> Self {
+        self.structured_output = Some(output);
+        self
+    }
+
+    /// The `tool_choice` wire value, or `None` when unset or no tools present.
+    fn tool_choice_value(&self, has_tools: bool) -> Option<Value> {
+        if !has_tools {
+            return None;
+        }
+        Some(match self.tool_choice.as_ref()? {
+            ToolChoice::Auto => serde_json::json!("auto"),
+            ToolChoice::None => serde_json::json!("none"),
+            ToolChoice::Required => serde_json::json!("required"),
+            ToolChoice::Tool(name) => {
+                serde_json::json!({ "type": "function", "function": { "name": name } })
+            }
+        })
+    }
+
+    /// The `response_format` wire value for a structured-output request.
+    fn response_format_value(&self) -> Option<Value> {
+        let so = self.structured_output.as_ref()?;
+        let mut schema = so.schema.clone();
+        sanitize_schema(&mut schema);
+        Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": so.name_or_default(),
+                "schema": schema,
+                "strict": so.strict,
+            }
+        }))
+    }
+
+    /// Set cross-provider sampling parameters. Unsupported keys (`top_k`) are
+    /// dropped with a warning; the rest map to the chat-completions body.
+    pub fn with_sampling(mut self, sampling: SamplingConfig) -> Self {
+        if sampling.top_k.is_some() {
+            tracing::warn!(
+                target: "sweet_llm::openai",
+                "top_k is unsupported by the OpenAI chat-completions API; ignoring"
+            );
+        }
+        self.sampling = sampling;
+        self
+    }
+
+    /// Choose which wire field carries replayed assistant reasoning history.
+    /// Defaults to `reasoning_content`; Cerebras sets this to `reasoning`.
+    pub(crate) fn with_reasoning_history_key(mut self, key: ReasoningHistoryKey) -> Self {
+        self.reasoning_history_key = key;
+        self
     }
 
     /// Construct a provider by reading the API key from the standard
@@ -100,24 +196,58 @@ impl OpenAIProvider {
         self
     }
 
-    /// Set the reasoning-effort parameter for thinking-mode models.
+    /// Configure reasoning for this provider.
     ///
-    /// Valid values are provider-specific (e.g. `"high"`, `"max"` for
-    /// DeepSeek).  The field is only sent when set.
-    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
-        self.reasoning_effort = Some(effort.into());
+    /// Maps the cross-provider [`ReasoningConfig`] to the OpenAI-compatible
+    /// wire:
+    /// - [`Toggle(b)`](ReasoningConfig::Toggle) -> `thinking: {type: enabled|disabled}`.
+    /// - [`Effort(e)`](ReasoningConfig::Effort) -> `reasoning_effort: e`.
+    /// - [`Budget(n)`](ReasoningConfig::Budget) -> `thinking: {type: enabled, budget_tokens: n}`.
+    ///
+    /// The dialects are mutually exclusive, so setting one clears the others.
+    /// When unset, no reasoning field is sent and prior `reasoning_content` is
+    /// suppressed from outgoing messages.
+    pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
+        match config {
+            ReasoningConfig::Toggle(enabled) => {
+                self.thinking = Some(ThinkingState {
+                    enabled,
+                    preserve_history: false,
+                    budget_tokens: None,
+                });
+                self.reasoning_effort = None;
+            }
+            ReasoningConfig::Budget(budget_tokens) => {
+                self.thinking = Some(ThinkingState {
+                    enabled: true,
+                    preserve_history: false,
+                    budget_tokens: Some(budget_tokens),
+                });
+                self.reasoning_effort = None;
+            }
+            ReasoningConfig::Effort(effort) => {
+                self.reasoning_effort = Some(effort);
+                self.thinking = None;
+            }
+        }
         self
     }
 
-    /// Configure chain-of-thought reasoning for this request.
-    ///
-    /// See [`ThinkingMode`] for the field semantics and the
-    /// [`ENABLED`](ThinkingMode::ENABLED) / [`DISABLED`](ThinkingMode::DISABLED) /
-    /// [`PRESERVED`](ThinkingMode::PRESERVED) presets. When unset, no
-    /// thinking field is sent and prior `reasoning_content` is suppressed
-    /// from outgoing messages.
-    pub fn with_thinking(mut self, mode: ThinkingMode) -> Self {
-        self.thinking = Some(mode);
+    /// Ask a thinking-aware backend to re-feed prior turns' `reasoning_content`
+    /// (`thinking.keep = "all"`). Kimi-specific (`kimi-k2.6`); ignored by
+    /// providers that do not support it. Enables the `thinking` object when one
+    /// is not already configured.
+    pub fn with_preserved_reasoning_history(mut self, preserve: bool) -> Self {
+        match self.thinking.as_mut() {
+            Some(state) => state.preserve_history = preserve,
+            None => {
+                self.thinking = Some(ThinkingState {
+                    enabled: true,
+                    preserve_history: preserve,
+                    budget_tokens: None,
+                })
+            }
+        }
         self
     }
 
@@ -139,22 +269,87 @@ impl OpenAIProvider {
             } else {
                 None
             },
+            budget_tokens: m.budget_tokens,
         })
     }
 
     /// Whether to echo prior turns' `reasoning_content` on the wire. Only
     /// true when the user has opted into a thinking-aware backend by setting
     /// one of the reasoning parameters.
-    fn echo_reasoning(&self) -> bool {
+    pub(crate) fn echo_reasoning(&self) -> bool {
         self.thinking.is_some() || self.reasoning_effort.is_some()
+    }
+
+    /// Whether a `thinking` object will be sent. Used by [`CerebrasProvider`](crate::CerebrasProvider)
+    /// tests to assert it never enables the object Cerebras rejects.
+    #[cfg(test)]
+    pub(crate) fn has_thinking(&self) -> bool {
+        self.thinking.is_some()
     }
 
     fn wire_messages<'a>(&self, messages: &'a [Message]) -> Vec<WireMessage<'a>> {
         let include_reasoning = self.echo_reasoning();
-        messages
-            .iter()
-            .map(|m| WireMessage::new(m, include_reasoning))
-            .collect()
+        let mut out: Vec<WireMessage<'a>> = Vec::with_capacity(messages.len());
+        let mut i = 0;
+        while i < messages.len() {
+            let msg = &messages[i];
+            if msg.role != Role::Tool {
+                out.push(WireMessage::new_with_key(
+                    msg,
+                    include_reasoning,
+                    self.reasoning_history_key,
+                ));
+                i += 1;
+                continue;
+            }
+
+            // A run of consecutive tool results. The Chat Completions protocol
+            // requires `tool` message content to be a string, so each tool
+            // message stays text (WireMessage::new drops any image blocks).
+            // Images a tool returned (e.g. a screenshot) are instead surfaced as
+            // a single follow-up `user` message after the whole run - the only
+            // place this protocol accepts images - so vision models can see
+            // them. The user message must come *after* every tool message in the
+            // group: no other role may interleave a turn's tool results.
+            let mut image_parts: Vec<WireContentPart> = Vec::new();
+            while i < messages.len() && messages[i].role == Role::Tool {
+                let tool_msg = &messages[i];
+                for block in &tool_msg.content {
+                    if let ContentBlock::Image { data, media_type } = block {
+                        let b64 = BASE64_STANDARD.encode(data);
+                        image_parts.push(WireContentPart::ImageUrl {
+                            image_url: WireImageUrl {
+                                url: format!("data:{media_type};base64,{b64}"),
+                                detail: None,
+                            },
+                        });
+                    }
+                }
+                out.push(WireMessage::new_with_key(
+                    tool_msg,
+                    include_reasoning,
+                    self.reasoning_history_key,
+                ));
+                i += 1;
+            }
+
+            if !image_parts.is_empty() {
+                let mut parts = Vec::with_capacity(image_parts.len() + 1);
+                parts.push(WireContentPart::Text {
+                    text: "Image(s) returned by the preceding tool call(s):".to_string(),
+                });
+                parts.extend(image_parts);
+                out.push(WireMessage {
+                    role: "user",
+                    content: Some(WireContent::Parts(parts)),
+                    reasoning_content: None,
+                    reasoning: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+        }
+        out
     }
 
     async fn complete_inner(
@@ -192,10 +387,21 @@ impl OpenAIProvider {
             stream_options: None,
             reasoning_effort: self.reasoning_effort.as_deref(),
             thinking: self.thinking_config(),
+            temperature: self.sampling.temperature,
+            top_p: self.sampling.top_p,
+            frequency_penalty: self.sampling.frequency_penalty,
+            presence_penalty: self.sampling.presence_penalty,
+            seed: self.sampling.seed,
+            max_tokens: self.sampling.max_tokens,
+            stop: (!self.sampling.stop.is_empty()).then_some(self.sampling.stop.as_slice()),
+            tool_choice: self.tool_choice_value(!tools.is_empty()),
+            response_format: self.response_format_value(),
         };
+        let mut body_value = serde_json::to_value(&body)?;
+        crate::sampling::merge_extra(&mut body_value, &self.sampling.extra);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let request_body = json_string(&body);
+        let request_body = json_string(&body_value);
         tracing::debug!(
             target: "sweet_llm::observability",
             event = "openai.complete.start",
@@ -213,7 +419,7 @@ impl OpenAIProvider {
             .http
             .post(&url)
             .header("User-Agent", &self.user_agent)
-            .json(&body);
+            .json(&body_value);
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
@@ -354,6 +560,7 @@ impl OpenAIProvider {
             reply.token_count = Some(usage.total_tokens);
             reply.context_tokens = Some(usage.prompt_tokens);
         }
+        reply.finish_reason = choice.finish_reason.as_deref().map(wire::map_finish_reason);
 
         let duration_ms = elapsed_ms(started);
         tracing::debug!(
@@ -412,7 +619,18 @@ impl OpenAIProvider {
             }),
             reasoning_effort: self.reasoning_effort.as_deref(),
             thinking: self.thinking_config(),
+            temperature: self.sampling.temperature,
+            top_p: self.sampling.top_p,
+            frequency_penalty: self.sampling.frequency_penalty,
+            presence_penalty: self.sampling.presence_penalty,
+            seed: self.sampling.seed,
+            max_tokens: self.sampling.max_tokens,
+            stop: (!self.sampling.stop.is_empty()).then_some(self.sampling.stop.as_slice()),
+            tool_choice: self.tool_choice_value(!tools.is_empty()),
+            response_format: self.response_format_value(),
         };
+        let mut body_value = serde_json::to_value(&body)?;
+        crate::sampling::merge_extra(&mut body_value, &self.sampling.extra);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         tracing::debug!(
@@ -431,7 +649,7 @@ impl OpenAIProvider {
             .http
             .post(&url)
             .header("User-Agent", &self.user_agent)
-            .json(&body);
+            .json(&body_value);
         if !self.api_key.is_empty() {
             req = req.bearer_auth(&self.api_key);
         }
@@ -467,6 +685,7 @@ impl OpenAIProvider {
         let mut tool_call_accums: Vec<ToolCallAccum> = Vec::new();
         let mut total_tokens: Option<usize> = None;
         let mut prompt_tokens: Option<usize> = None;
+        let mut finish_reason: Option<String> = None;
         let mut done = false;
 
         while let Some(chunk) = stream.next().await {
@@ -485,7 +704,15 @@ impl OpenAIProvider {
                         prompt_tokens = Some(usage.prompt_tokens);
                     }
                     for choice in chunk.choices {
-                        if let Some(ref rc) = choice.delta.reasoning_content {
+                        if let Some(ref fr) = choice.finish_reason {
+                            finish_reason = Some(fr.clone());
+                        }
+                        let reasoning_delta = choice
+                            .delta
+                            .reasoning_content
+                            .as_deref()
+                            .or(choice.delta.reasoning.as_deref());
+                        if let Some(rc) = reasoning_delta {
                             saw_reasoning_field = true;
                             if !rc.is_empty() {
                                 reasoning_content.push_str(rc);
@@ -556,10 +783,12 @@ impl OpenAIProvider {
             token_count: total_tokens,
             context_tokens: prompt_tokens,
             compacted: false,
+            finish_reason: None,
         };
         if saw_reasoning_field {
             reply.set_reasoning_content(reasoning_content);
         }
+        reply.finish_reason = finish_reason.as_deref().map(wire::map_finish_reason);
 
         let duration_ms = elapsed_ms(started);
         tracing::debug!(
@@ -634,19 +863,20 @@ mod tests {
     }
 
     #[test]
-    fn enabled_preset_emits_type_enabled_without_keep() {
+    fn toggle_on_emits_type_enabled_without_keep() {
         let cfg = OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode::ENABLED)
+            .with_reasoning(ReasoningConfig::Toggle(true))
             .thinking_config()
             .unwrap();
         assert_eq!(cfg.r#type, "enabled");
         assert_eq!(cfg.keep, None);
+        assert_eq!(cfg.budget_tokens, None);
     }
 
     #[test]
-    fn disabled_preset_emits_type_disabled() {
+    fn toggle_off_emits_type_disabled() {
         let cfg = OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode::DISABLED)
+            .with_reasoning(ReasoningConfig::Toggle(false))
             .thinking_config()
             .unwrap();
         assert_eq!(cfg.r#type, "disabled");
@@ -654,9 +884,44 @@ mod tests {
     }
 
     #[test]
-    fn preserved_preset_emits_enabled_with_keep_all() {
+    fn budget_emits_enabled_with_budget_tokens() {
         let cfg = OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode::PRESERVED)
+            .with_reasoning(ReasoningConfig::Budget(2048))
+            .thinking_config()
+            .unwrap();
+        assert_eq!(cfg.r#type, "enabled");
+        assert_eq!(cfg.budget_tokens, Some(2048));
+    }
+
+    #[test]
+    fn effort_sets_reasoning_effort_not_thinking() {
+        let p =
+            OpenAIProvider::new("k").with_reasoning(ReasoningConfig::Effort("high".to_string()));
+        assert_eq!(p.reasoning_effort.as_deref(), Some("high"));
+        assert!(p.thinking_config().is_none());
+    }
+
+    #[test]
+    fn setting_one_dialect_clears_the_other() {
+        // Effort after a toggle drops the thinking object, and vice-versa.
+        let p = OpenAIProvider::new("k")
+            .with_reasoning(ReasoningConfig::Toggle(true))
+            .with_reasoning(ReasoningConfig::Effort("low".to_string()));
+        assert!(p.thinking_config().is_none());
+        assert_eq!(p.reasoning_effort.as_deref(), Some("low"));
+
+        let p = OpenAIProvider::new("k")
+            .with_reasoning(ReasoningConfig::Effort("low".to_string()))
+            .with_reasoning(ReasoningConfig::Toggle(true));
+        assert!(p.thinking_config().is_some());
+        assert_eq!(p.reasoning_effort, None);
+    }
+
+    #[test]
+    fn preserved_history_emits_enabled_with_keep_all() {
+        let cfg = OpenAIProvider::new("k")
+            .with_reasoning(ReasoningConfig::Toggle(true))
+            .with_preserved_reasoning_history(true)
             .thinking_config()
             .unwrap();
         assert_eq!(cfg.r#type, "enabled");
@@ -664,15 +929,12 @@ mod tests {
     }
 
     #[test]
-    fn custom_disabled_with_preserve_history_round_trips() {
+    fn preserved_history_without_prior_thinking_enables_it() {
         let cfg = OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode {
-                enabled: false,
-                preserve_history: true,
-            })
+            .with_preserved_reasoning_history(true)
             .thinking_config()
             .unwrap();
-        assert_eq!(cfg.r#type, "disabled");
+        assert_eq!(cfg.r#type, "enabled");
         assert_eq!(cfg.keep, Some("all"));
     }
 
@@ -685,16 +947,45 @@ mod tests {
     #[test]
     fn echo_reasoning_on_when_thinking_or_effort_set() {
         assert!(OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode::ENABLED)
+            .with_reasoning(ReasoningConfig::Toggle(true))
             .echo_reasoning());
         assert!(OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode::DISABLED)
+            .with_reasoning(ReasoningConfig::Toggle(false))
             .echo_reasoning());
         assert!(OpenAIProvider::new("k")
-            .with_thinking(ThinkingMode::PRESERVED)
+            .with_reasoning(ReasoningConfig::Budget(1024))
             .echo_reasoning());
         assert!(OpenAIProvider::new("k")
-            .with_reasoning_effort("high")
+            .with_reasoning(ReasoningConfig::Effort("high".to_string()))
             .echo_reasoning());
+    }
+
+    #[test]
+    fn tool_choice_maps_to_wire() {
+        let p = OpenAIProvider::new("k").with_tool_choice(ToolChoice::Required);
+        assert_eq!(
+            p.tool_choice_value(true),
+            Some(serde_json::json!("required"))
+        );
+        // Omitted when the request carries no tools.
+        assert_eq!(p.tool_choice_value(false), None);
+
+        let p = OpenAIProvider::new("k").with_tool_choice(ToolChoice::Tool("x".into()));
+        assert_eq!(
+            p.tool_choice_value(true),
+            Some(serde_json::json!({ "type": "function", "function": { "name": "x" } }))
+        );
+    }
+
+    #[test]
+    fn structured_output_maps_to_response_format() {
+        let p = OpenAIProvider::new("k").with_structured_output(StructuredOutput::new(
+            serde_json::json!({ "type": "object" }),
+        ));
+        let rf = p.response_format_value().unwrap();
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["name"], "response");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        assert_eq!(rf["json_schema"]["schema"]["type"], "object");
     }
 }

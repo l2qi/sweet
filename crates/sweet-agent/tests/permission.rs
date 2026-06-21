@@ -34,7 +34,7 @@ async fn readonly_tool_always_executes_in_normal_mode() {
 
     let result = agent.step_stream("go", &mut io).await.unwrap();
     assert!(matches!(result, TurnResult::Message(_)));
-    // No approval requests — readonly tools skip the gate.
+    // No approval requests - readonly tools skip the gate.
     assert!(io.approval_requests.is_empty());
 }
 
@@ -95,7 +95,7 @@ async fn write_tool_executes_when_approved_in_normal_mode() {
     // Approval was requested.
     assert_eq!(io.approval_requests.len(), 1);
 
-    // The tool actually executed — result contains the echoed args.
+    // The tool actually executed - result contains the echoed args.
     let tool_results = io.tool_results();
     assert_eq!(tool_results.len(), 1);
     assert!(tool_results[0].1.contains("msg"));
@@ -121,7 +121,7 @@ async fn write_tool_auto_approved_in_auto_edit_mode() {
     let result = agent.step_stream("go", &mut io).await.unwrap();
     assert!(matches!(result, TurnResult::Message(_)));
 
-    // No approval requests — auto-edit mode auto-approves file writes.
+    // No approval requests - auto-edit mode auto-approves file writes.
     assert!(io.approval_requests.is_empty());
     // Tool executed.
     assert_eq!(io.tool_results().len(), 1);
@@ -147,7 +147,7 @@ async fn dangerous_tool_still_asks_in_auto_edit_mode() {
     let result = agent.step_stream("go", &mut io).await.unwrap();
     assert!(matches!(result, TurnResult::Message(_)));
 
-    // Approval was requested — dangerous tools still ask in auto-edit.
+    // Approval was requested - dangerous tools still ask in auto-edit.
     assert_eq!(io.approval_requests.len(), 1);
 }
 
@@ -180,7 +180,7 @@ async fn all_tools_auto_approved_in_full_auto_mode() {
     let result = agent.step_stream("go", &mut io).await.unwrap();
     assert!(matches!(result, TurnResult::Message(_)));
 
-    // No approval requests — full auto approves everything.
+    // No approval requests - full auto approves everything.
     assert!(io.approval_requests.is_empty());
     // Both tools executed.
     assert_eq!(io.tool_results().len(), 2);
@@ -225,7 +225,7 @@ async fn allow_session_persists_across_calls() {
 #[tokio::test]
 async fn allow_session_is_scoped_to_the_call() {
     // Approving "Always" for one bash command must not whitelist a different
-    // command — the grant is keyed by (tool, scope), not the bare tool name.
+    // command - the grant is keyed by (tool, scope), not the bare tool name.
     let tool = tool_with_risk("bash", ToolRisk::Dangerous);
     let model = MockModel::with_scripted([
         MockModel::reply_tool_calls(vec![ToolCall {
@@ -249,7 +249,7 @@ async fn allow_session_is_scoped_to_the_call() {
     let result = agent.step_stream("go", &mut io).await.unwrap();
     assert!(matches!(result, TurnResult::Message(_)));
 
-    // Both calls prompted — a different command is a different scope.
+    // Both calls prompted - a different command is a different scope.
     assert_eq!(io.approval_requests.len(), 2);
     assert_eq!(io.tool_results().len(), 2);
 }

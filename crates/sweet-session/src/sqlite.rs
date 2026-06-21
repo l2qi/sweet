@@ -18,7 +18,7 @@ use sweet_core::{MemoryItem, Message, Session, SessionError, SessionId};
 /// # Archived rows
 ///
 /// [`replace_range`](Session::replace_range) (compaction) does not delete the
-/// rows it replaces — it marks them `archived`. Archived rows are invisible
+/// rows it replaces - it marks them `archived`. Archived rows are invisible
 /// to the [`Session`] trait (`items`, `messages`, `token_count`,
 /// `total_tokens`) but are retained on disk and readable via
 /// [`full_messages`](Self::full_messages) / [`full_items`](Self::full_items),

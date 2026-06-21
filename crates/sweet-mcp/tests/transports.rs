@@ -9,7 +9,7 @@
 //! network access and no external tooling are required.
 //!
 //! The fixture binary is built by `cargo test --workspace` (it is a workspace
-//! member). Running `cargo test -p sweet-mcp` in isolation will not build it —
+//! member). Running `cargo test -p sweet-mcp` in isolation will not build it -
 //! `mock_server_bin` asserts a clear message in that case.
 
 use std::collections::HashMap;
@@ -24,9 +24,9 @@ use tokio::process::{Child, Command};
 ///
 /// `Command::kill_on_drop(true)` on its own has been observed to leak the
 /// child when the per-test tokio runtime tears down at the same instant the
-/// `Child` is dropped — the SIGKILL is never delivered and the mock-server
+/// `Child` is dropped - the SIGKILL is never delivered and the mock-server
 /// orphans to launchd/init, keeping its inherited stdout pipe open and
-/// hanging any pipeline (`cargo test … | tail`) reading from it.
+/// hanging any pipeline (`cargo test ... | tail`) reading from it.
 ///
 /// `start_kill` calls `libc::kill(pid, SIGKILL)` synchronously and does not
 /// touch the runtime, so it works reliably from a `Drop` impl. We do not
@@ -49,7 +49,7 @@ fn mock_server_bin() -> PathBuf {
     let bin = dir.join("sweet-mcp-mock-server");
     assert!(
         bin.exists(),
-        "sweet-mcp-mock-server fixture not found at {} — run the suite with `cargo test --workspace`",
+        "sweet-mcp-mock-server fixture not found at {} - run the suite with `cargo test --workspace`",
         bin.display()
     );
     bin

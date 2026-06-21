@@ -82,7 +82,7 @@ impl<T> Extension for T where T: CapabilityProvider + Send + Sync {}
 
 /// A named bundle of tools, installable on an agent as a [`CapabilityProvider`].
 ///
-/// Tool-producing crates (`sweet-tools`, `sweet-mcp`, …) stay `sweet-core`-only
+/// Tool-producing crates (`sweet-tools`, `sweet-mcp`, ...) stay `sweet-core`-only
 /// and just yield [`ToolSpec`]s. The consumer groups them into a named bundle
 /// and installs it with [`Agent::with_capability_provider`], so leaf tools
 /// enter the agent through the same capability path as commands and hooks

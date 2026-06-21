@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Ryuichi Intellectual Property LLC and the Sweet project contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OS-enforced sandbox — bundles an OS-restricted runner + RestrictedFs.
+//! OS-enforced sandbox - bundles an OS-restricted runner + RestrictedFs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::restricted_fs::RestrictedFs;
 ///
 /// Policy is fixed at construction time. Neither backend can filter network
 /// by host or IP at the kernel layer, so there is no mid-session escape
-/// hatch — to change the policy the caller restarts.
+/// hatch - to change the policy the caller restarts.
 pub struct OsSandbox {
     runner: Arc<dyn CommandRunner>,
     fs: Arc<dyn Filesystem>,
@@ -34,7 +34,7 @@ impl OsSandbox {
     /// `policy` controls sandbox and network restrictions and is fixed for
     /// the lifetime of the sandbox.
     /// `extra_read_roots` are additional directories the agent may read but not
-    /// write — e.g. a directory holding session state outside the project root,
+    /// write - e.g. a directory holding session state outside the project root,
     /// so the agent can read those files back even though the home directory is
     /// otherwise hidden.
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)

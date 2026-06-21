@@ -205,7 +205,7 @@ impl Session for InMemorySession {
 /// current transcript. Writes from the consumer do not flow back through the
 /// handle.
 ///
-/// Construct only via [`SharedSession::new`] — a standalone handle is never
+/// Construct only via [`SharedSession::new`] - a standalone handle is never
 /// written to and would always snapshot empty.
 #[derive(Clone)]
 pub struct SharedSessionHandle {
@@ -213,7 +213,7 @@ pub struct SharedSessionHandle {
 }
 
 impl SharedSessionHandle {
-    /// Copy the current messages. Cheap relative to the agent loop — one clone
+    /// Copy the current messages. Cheap relative to the agent loop - one clone
     /// per consumer invocation.
     pub fn snapshot_messages(&self) -> Vec<Message> {
         self.snapshot
@@ -274,7 +274,7 @@ impl Session for SharedSession {
     fn push(&mut self, item: MemoryItem) -> Result<()> {
         // Extract the message before the move into `inner.push`. Mirroring the
         // append directly keeps the hot path O(1); a full
-        // `inner.messages()` snapshot per push would be O(n²) across a
+        // `inner.messages()` snapshot per push would be O(n^2) across a
         // long session.
         let mirror = match &item {
             MemoryItem::Message(msg) => msg.clone(),

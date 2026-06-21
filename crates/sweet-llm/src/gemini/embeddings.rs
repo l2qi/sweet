@@ -13,7 +13,7 @@ use super::{DEFAULT_API_KEY_ENV, DEFAULT_BASE_URL};
 pub const DEFAULT_EMBEDDING_MODEL: &str = "gemini-embedding-001";
 
 /// Default requested vector size. `gemini-embedding-001` natively produces
-/// 3072 dimensions; 768 keeps stored vectors ~4× smaller at a negligible
+/// 3072 dimensions; 768 keeps stored vectors ~4x smaller at a negligible
 /// quality cost for memory-recall workloads.
 pub const DEFAULT_OUTPUT_DIMENSIONALITY: usize = 768;
 

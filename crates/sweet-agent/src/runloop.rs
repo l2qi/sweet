@@ -16,7 +16,7 @@ use crate::handoff::TurnResult;
 ///
 /// Returning `Ok(None)` from `read_input` signals end-of-input and exits the
 /// loop cleanly. Empty/whitespace-only lines are filtered by the caller of
-/// `read_input` (e.g. the CLI), not here — the runloop forwards every line it
+/// `read_input` (e.g. the CLI), not here - the runloop forwards every line it
 /// receives.
 ///
 /// Streaming UI events (`on_content_delta`, `on_tool_call`, `on_tool_result`,
@@ -102,7 +102,7 @@ where
 }
 
 /// Adapter that lets an [`AgentIo`] act as a [`StreamSink`] for the duration
-/// of a single agent step. Forwarding-only — no buffering or transformation.
+/// of a single agent step. Forwarding-only - no buffering or transformation.
 pub(crate) struct IoStreamSink<'a, Io: AgentIo + ?Sized> {
     io: &'a mut Io,
 }
