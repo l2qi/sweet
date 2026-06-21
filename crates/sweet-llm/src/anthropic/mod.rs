@@ -488,6 +488,8 @@ impl AnthropicProvider {
 
         let mut block_states: Vec<BlockState> = Vec::new();
         let mut input_tokens: Option<usize> = None;
+        let mut cache_creation_input_tokens: Option<usize> = None;
+        let mut cache_read_input_tokens: Option<usize> = None;
         let mut output_tokens: Option<usize> = None;
         let mut stop_reason: Option<String> = None;
         let mut done = false;
@@ -505,7 +507,13 @@ impl AnthropicProvider {
                 match event {
                     StreamEvent::MessageStart { message } => {
                         if let Some(usage) = message.usage {
+                            // `input_tokens` is the *uncached* count; the cache
+                            // read/write totals are reported separately and must
+                            // be folded in so context tracking matches the
+                            // non-streaming path (see `Usage::total_input`).
                             input_tokens = usage.input_tokens;
+                            cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                            cache_read_input_tokens = usage.cache_read_input_tokens;
                         }
                     }
                     StreamEvent::ContentBlockStart {
@@ -673,8 +681,8 @@ impl AnthropicProvider {
             .map(|(input, output)| wire::Usage {
                 input_tokens: Some(input),
                 output_tokens: Some(output),
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
             });
 
         let mut reply = message_from_content_blocks(final_blocks, usage)?;

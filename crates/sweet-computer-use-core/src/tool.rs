@@ -178,13 +178,14 @@ impl ComputerUseHandler {
 
     /// Map a model-supplied action's coordinates to display pixels (per
     /// [`CoordinateSpace`]) and clamp them on-screen. Non-coordinate actions are
-    /// returned unchanged without touching the display.
+    /// unaffected (their `scaled`/`clamped` arms are identity).
+    ///
+    /// Clamping runs in both coordinate spaces, not just `Normalized`: a model
+    /// aims at what it sees, and the screenshot, element frames, and cursor all
+    /// live in the main display's space, so an off-screen coordinate (negative
+    /// or oversized) should land on a visible pixel rather than fire a no-op
+    /// click - in absolute space too, where `scaled` is the identity.
     async fn to_pixels(&self, action: ComputerAction) -> Result<ComputerAction, ToolError> {
-        // Absolute space with nothing to clamp against would be a no-op anyway;
-        // only pay for a screen-size lookup when it can change the action.
-        if matches!(self.coordinate_space, CoordinateSpace::Absolute) {
-            return Ok(action);
-        }
         let screen = self.screen_size().await?;
         let (sx, sy) = self.coordinate_space.scale(screen);
         Ok(action.scaled(sx, sy).clamped(
@@ -407,6 +408,25 @@ mod tests {
             ComputerAction::Click { x, y, .. } => {
                 assert_eq!(x, 0.0);
                 assert_eq!(y, 1168.0); // clamped to height - 1
+            }
+            other => panic!("expected click, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn absolute_off_screen_coordinates_are_clamped() {
+        // Clamping applies in absolute space too: an off-screen coordinate must
+        // land on a visible pixel rather than fire a no-op click.
+        let provider = Arc::new(FakeProvider::default());
+        let tool = computer_use_tool(provider.clone(), CoordinateSpace::Absolute);
+        tool.call(serde_json::json!({"action": "click", "x": -50, "y": 9000}))
+            .await
+            .unwrap();
+        let recorded = provider.last_action.lock().unwrap().clone().unwrap();
+        match recorded {
+            ComputerAction::Click { x, y, .. } => {
+                assert_eq!(x, 0.0);
+                assert_eq!(y, 1168.0); // height - 1 (screen 1800x1169)
             }
             other => panic!("expected click, got {other:?}"),
         }

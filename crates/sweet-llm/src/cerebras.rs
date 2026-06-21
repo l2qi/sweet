@@ -7,8 +7,16 @@
 use sweet_core::stream::StreamSink;
 use sweet_core::{async_trait, Message, Model, Result, ToolSpec};
 
+use crate::error::ProviderError;
 use crate::openai::{OpenAIProvider, ReasoningHistoryKey};
 use crate::{ReasoningConfig, SamplingConfig, StructuredOutput, ToolChoice};
+
+/// Cerebras Inference's OpenAI-compatible endpoint. Without this, the composed
+/// [`OpenAIProvider`] would default to `api.openai.com` and a Cerebras key would
+/// be sent to the wrong vendor.
+pub const DEFAULT_BASE_URL: &str = "https://api.cerebras.ai/v1";
+/// Environment variable read by [`CerebrasProvider::from_env`].
+pub const DEFAULT_API_KEY_ENV: &str = "CEREBRAS_API_KEY";
 
 /// Inference provider for [Cerebras Inference](https://inference.cerebras.ai).
 ///
@@ -33,15 +41,25 @@ pub struct CerebrasProvider {
 }
 
 impl CerebrasProvider {
-    /// Construct a provider with an explicit API key.
+    /// Construct a provider with an explicit API key, pointed at Cerebras's
+    /// endpoint (override with [`with_base_url`](Self::with_base_url)).
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             // Cerebras expects replayed assistant reasoning under `reasoning`,
             // not the OpenAI-compatible `reasoning_content` (it renames the
             // field server-side and rejects the wrong key in strict modes).
             inner: OpenAIProvider::new(api_key)
+                .with_base_url(DEFAULT_BASE_URL)
                 .with_reasoning_history_key(ReasoningHistoryKey::Reasoning),
         }
+    }
+
+    /// Read the API key from the environment variable `CEREBRAS_API_KEY`.
+    pub fn from_env() -> Result<Self> {
+        let key = std::env::var(DEFAULT_API_KEY_ENV).map_err(|_| ProviderError::MissingApiKey {
+            var: DEFAULT_API_KEY_ENV,
+        })?;
+        Ok(Self::new(key))
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -171,5 +189,15 @@ mod tests {
     fn context_window_delegates_to_inner() {
         let p = CerebrasProvider::new("k").with_context_window(131_072);
         assert_eq!(p.context_window(), Some(131_072));
+    }
+
+    #[test]
+    fn defaults_to_cerebras_endpoint_not_openai() {
+        // A Cerebras key must not be sent to api.openai.com by default.
+        let p = CerebrasProvider::new("k");
+        assert_eq!(p.inner.base_url(), DEFAULT_BASE_URL);
+        // An explicit override still wins.
+        let p = CerebrasProvider::new("k").with_base_url("https://proxy.example/v1");
+        assert_eq!(p.inner.base_url(), "https://proxy.example/v1");
     }
 }

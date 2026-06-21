@@ -550,6 +550,49 @@ async fn complete_stream_with_thinking_emits_thinking_deltas_and_captures_thinki
     assert_eq!(sink.deltas(), vec!["Answer: 42"]);
 }
 
+/// Streaming must fold the cache read/write totals from `message_start` into the
+/// reported context size, matching the non-streaming path. Anthropic reports
+/// `input_tokens` as the *uncached* portion only, so with prompt caching on (the
+/// default) the bulk of the prompt arrives as `cache_read_input_tokens`; dropping
+/// it would massively undercount the context and stall compaction.
+#[tokio::test]
+async fn complete_stream_includes_cache_tokens_in_context_size() {
+    let server = MockServer::start().await;
+
+    let body = sse_body(&[
+        r#"{"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":700,"output_tokens":0}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":20}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]);
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new("k").with_base_url(server.uri());
+
+    let mut sink = CapturingSink::new();
+    let reply = provider
+        .complete_stream(&[Message::user("hi")], &[], &mut sink)
+        .await
+        .unwrap();
+
+    // context = 10 (uncached) + 200 (cache write) + 700 (cache read) = 910.
+    assert_eq!(reply.context_tokens, Some(910));
+    // token_count = context + output = 910 + 20 = 930.
+    assert_eq!(reply.token_count, Some(930));
+}
+
 /// Multi-turn thinking: signatures ride along on `Message.thinking_content`,
 /// so a previous turn's thinking block is re-emitted verbatim when the
 /// caller passes the prior assistant `Message` back into `complete`.

@@ -96,6 +96,13 @@ pub(crate) struct FunctionCall {
 pub(crate) struct FunctionResponse {
     pub name: String,
     pub response: Value,
+    /// Multimodal content returned by the tool (e.g. a screenshot), nested
+    /// inside the response. Gemini 3+ accepts `inlineData` parts here, so an
+    /// image rides on the function response itself rather than a separate
+    /// content - keeping the user/model turn alternation intact. Omitted when
+    /// the tool returned no media.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Part>,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,13 +238,31 @@ pub(crate) fn convert_messages(
         }
 
         if msg.role == Role::Tool {
-            // Group consecutive tool-result messages into a single user
-            // content with multiple functionResponse parts.
+            // Group consecutive tool-result messages into a single user content
+            // with multiple functionResponse parts. Any image a tool returned
+            // (e.g. a screenshot) is nested inside its functionResponse via the
+            // `parts` field - the documented Gemini 3+ shape for multimodal
+            // tool results - so the image stays attached to the response that
+            // produced it and the user/model turn alternation is preserved.
             let mut parts = Vec::new();
             while i < messages.len() && messages[i].role == Role::Tool {
                 let tool_msg = &messages[i];
                 let tc_id = tool_msg.tool_call_id.clone().unwrap_or_default();
                 let name = tool_names.get(&tc_id).cloned().unwrap_or_default();
+                let response_parts: Vec<Part> = tool_msg
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Image { data, media_type } => Some(Part {
+                            inline_data: Some(InlineData {
+                                mime_type: media_type.clone(),
+                                data: base64::prelude::BASE64_STANDARD.encode(data),
+                            }),
+                            ..Default::default()
+                        }),
+                        _ => None,
+                    })
+                    .collect();
                 parts.push(Part {
                     function_response: Some(FunctionResponse {
                         name: name.clone(),
@@ -245,6 +270,7 @@ pub(crate) fn convert_messages(
                             "name": name,
                             "content": tool_msg.text_content(),
                         }),
+                        parts: response_parts,
                     }),
                     ..Default::default()
                 });
@@ -469,6 +495,67 @@ mod tests {
             serde_json::json!({ "name": "echo", "content": "hello world" })
         );
         assert_eq!(resp.name, "echo");
+    }
+
+    #[test]
+    fn tool_result_image_nests_inside_function_response() {
+        // A screenshot returned by a tool rides inside its functionResponse via
+        // the `parts` field (Gemini 3+ multimodal tool results), staying in the
+        // single user content rather than spawning a second one.
+        let mut names = HashMap::new();
+        names.insert("call_1".to_string(), "computer".to_string());
+
+        let tool_msg = Message::tool_result_blocks(
+            "call_1",
+            vec![
+                ContentBlock::text("Screenshot captured"),
+                ContentBlock::Image {
+                    data: vec![1, 2, 3],
+                    media_type: "image/png".into(),
+                },
+            ],
+        );
+        let (_, contents) = convert_messages(&[tool_msg], &HashMap::new(), &names);
+
+        // One content with one functionResponse part - alternation preserved.
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].parts.len(), 1);
+        let resp = contents[0].parts[0].function_response.as_ref().unwrap();
+        assert_eq!(
+            resp.response,
+            serde_json::json!({ "name": "computer", "content": "Screenshot captured" })
+        );
+        // The image is nested in the response's `parts` as inlineData.
+        assert_eq!(resp.parts.len(), 1);
+        let inline = resp.parts[0].inline_data.as_ref().unwrap();
+        assert_eq!(inline.mime_type, "image/png");
+
+        // Lock in the serialized wire shape Gemini expects.
+        let req = GenerateContentRequest {
+            system_instruction: None,
+            contents,
+            tools: None,
+            generation_config: None,
+            tool_config: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let fr = &json["contents"][0]["parts"][0]["functionResponse"];
+        assert_eq!(fr["parts"][0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(fr["response"]["content"], "Screenshot captured");
+    }
+
+    #[test]
+    fn text_only_tool_result_omits_function_response_parts() {
+        // No media -> no `parts` key on the wire (skip_serializing_if).
+        let (_, contents) = convert_messages(&[tool_msg("call_1", "ok")], &HashMap::new(), &{
+            let mut m = HashMap::new();
+            m.insert("call_1".to_string(), "echo".to_string());
+            m
+        });
+        let resp = contents[0].parts[0].function_response.as_ref().unwrap();
+        assert!(resp.parts.is_empty());
+        let json = serde_json::to_value(&contents[0].parts[0]).unwrap();
+        assert!(json["functionResponse"].get("parts").is_none());
     }
 
     #[test]
