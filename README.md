@@ -11,12 +11,14 @@ Sweet provides the building blocks for building autonomous AI agents: a composab
 | `sweet-core` | Core traits and types: `Model`, `Message`, `ToolSpec`, `Session`, `Sandbox` |
 | `sweet-tool-derive` | `#[derive(Tool)]` proc-macro for stateless tools |
 | `sweet-agent` | Agent loop, hooks, subagents, handoffs, and command routing |
-| `sweet-llm` | LLM provider and embedder implementations: OpenAI, Gemini, Anthropic |
+| `sweet-llm` | LLM provider and embedder implementations: OpenAI (and Cerebras), Gemini, Anthropic |
 | `sweet-tools` | Universal built-in tools: HTTP fetch, web search, clock |
 | `sweet-session` | Session implementations: in-memory and SQLite-backed |
 | `sweet-memory` | Long-term memory: SQLite store with hybrid FTS5 + embedding recall, memory tools, optional sqlite-vec vector search |
 | `sweet-sandbox` | OS-level sandboxing: macOS Seatbelt and Linux Bubblewrap |
 | `sweet-mcp` | MCP tool provider via the official `rmcp` SDK |
+| `sweet-computer-use-core` | Platform-neutral computer-use substrate: GUI actions, observations, provider trait, and the `computer` tool |
+| `sweet-computer-use-macos` | macOS computer-use backend: accessibility tree, Quartz input events, screen capture |
 | `sweet-mcp-mock-server` | Mock MCP server for hermetic integration tests |
 
 ## Quick Start
@@ -59,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `openai` | yes | OpenAI and OpenAI-compatible providers + `OpenAIEmbedder` |
+| `openai` | yes | OpenAI and OpenAI-compatible providers (`OpenAIProvider`, `CerebrasProvider`) + `OpenAIEmbedder` |
 | `gemini` | yes | Google Gemini provider + `GeminiEmbedder` |
 | `anthropic` | yes | Anthropic Claude provider |
 

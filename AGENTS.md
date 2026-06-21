@@ -85,8 +85,8 @@ Anti-patterns to avoid:
 
 ### Providers
 
-- Wire-protocol provider implementations live in `sweet-llm`: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider` — one per protocol.
-- An OpenAI-wire-compatible endpoint (Cerebras, OpenRouter, etc.) is `OpenAIProvider` preconfigured with a base URL — not a new provider. Such newtypes belong next to their consumer, not in `sweet-llm`.
+- Wire-protocol provider implementations live in `sweet-llm`: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `CerebrasProvider` — one per protocol (or protocol-plus-reasoning-dialect).
+- An OpenAI-wire-compatible endpoint (OpenRouter, a local llama server, etc.) with no reasoning quirks is `OpenAIProvider` preconfigured with a base URL — not a new provider; such newtypes belong next to their consumer, not in `sweet-llm`. The exception is when the endpoint diverges on *reasoning* semantics beyond a base URL: `CerebrasProvider` earns its own dedicated provider because it rejects the `thinking` object, uses `reasoning` (not `reasoning_content`) as the history key, and is effort-only — divergences that cannot be expressed by composition alone. A provider whose only difference is the base URL never earns a dedicated provider.
 - If the new protocol is genuinely different, create `src/<protocol>/mod.rs` and `src/<protocol>/wire.rs` (private serde DTOs in `wire.rs`).
 - Gate every provider behind its own Cargo feature. Add `#[cfg(feature = "...")]` to the module declaration in `lib.rs` and `#![cfg(feature = "...")]` at the top of its integration test file.
 - Follow the `DEFAULT_BASE_URL`, `DEFAULT_API_KEY_ENV`, `DEFAULT_MODEL` constant naming convention.

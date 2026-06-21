@@ -41,8 +41,19 @@ impl CoordinateSpace {
     }
 }
 
-const DESCRIPTION: &str = "\
-Observe and control the local macOS desktop GUI: read the screen's accessibility \
+/// Build the per-tool description, filling in the platform name (e.g.
+/// `"macos"`, `"linux"`) reported by the provider, capitalized for prose.
+/// Kept platform-agnostic so the core crate is not wired to any one backend.
+fn description(platform: &str) -> String {
+    // Capitalize the first letter so a lowercase identifier like "macos"
+    // reads as "Macos" in the model-facing prose.
+    let mut platform = platform.to_string();
+    if let Some(first) = platform.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    format!(
+        "\
+Observe and control the local {platform} desktop GUI: read the screen's accessibility \
 state and perform bounded mouse/keyboard actions. Use this only for tasks that \
 genuinely require the GUI (driving a desktop app, a browser, or visually \
 verifying running software) - prefer file, shell, and search tools for ordinary \
@@ -67,11 +78,13 @@ crosshair (and reported as `Cursor: (x, y)`): aim relative to the crosshair, \
 `click`. This observe -> move -> verify loop is the reliable way to hit a target.
 
 Set `action` to one of: \
-observe { include_screenshot? } | screenshot | click { x, y, button? } | \
-double_click { x, y } | right_click { x, y } | move { x, y } | \
-scroll { x, y, dx?, dy? } | drag { from_x, from_y, to_x, to_y } | \
-type_text { text } | key_chord { keys: [..] } | ax_press { element } | \
-ax_set_value { element, value } | wait { millis } | open_app { name }.";
+observe {{ include_screenshot? }} | screenshot | click {{ x, y, button? }} | \
+double_click {{ x, y }} | right_click {{ x, y }} | move {{ x, y }} | \
+scroll {{ x, y, dx?, dy? }} | drag {{ from_x, from_y, to_x, to_y }} | \
+type_text {{ text }} | key_chord {{ keys: [..] }} | ax_press {{ element }} | \
+ax_set_value {{ element, value }} | wait {{ millis }} | open_app {{ name }}."
+    )
+}
 
 /// Build the `computer` tool backed by `provider`, interpreting model
 /// coordinates according to `coordinate_space`.
@@ -82,7 +95,7 @@ ax_set_value { element, value } | wait { millis } | open_app { name }.";
 pub fn computer_use_tool(provider: SharedProvider, coordinate_space: CoordinateSpace) -> ToolSpec {
     ToolSpec::new(
         COMPUTER_TOOL_NAME,
-        DESCRIPTION,
+        description(provider.platform()),
         schema(),
         ComputerUseHandler {
             provider,
@@ -144,7 +157,7 @@ impl ComputerUseHandler {
     async fn observe(&self, opts: &ObserveOptions) -> Result<ComputerObservation, ToolError> {
         let obs = self.provider.observe(opts).await.map_err(execution_error)?;
         if obs.screen_size.width > 0.0 && obs.screen_size.height > 0.0 {
-            *self.screen.lock().unwrap() = Some(obs.screen_size);
+            *locked(&self.screen) = Some(obs.screen_size);
         }
         Ok(obs)
     }
@@ -152,7 +165,7 @@ impl ComputerUseHandler {
     /// The current display size - cached from the last observe, or fetched once
     /// if no observe has happened yet this session.
     async fn screen_size(&self) -> Result<Size, ToolError> {
-        if let Some(size) = *self.screen.lock().unwrap() {
+        if let Some(size) = *locked(&self.screen) {
             return Ok(size);
         }
         let opts = ObserveOptions {
@@ -181,6 +194,14 @@ impl ComputerUseHandler {
     }
 }
 
+/// Acquire the screen-size cache lock, recovering from poisoning rather than
+/// panicking: a poisoned mutex only means a prior lock holder panicked, and the
+/// cached `Option<Size>` is still perfectly usable (a stale or `None` value at
+/// worst causes one extra `observe` round-trip).
+fn locked(screen: &Mutex<Option<Size>>) -> std::sync::MutexGuard<'_, Option<Size>> {
+    screen.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Render an observation to text and attach its screenshot (if captured) as an
 /// image block, so vision-capable models receive the pixels alongside the
 /// accessibility text. On text-only protocols the image is dropped downstream.
@@ -196,7 +217,7 @@ fn observation_output(obs: &ComputerObservation) -> ToolOutput {
 
 /// JSON Schema for the tool input. Kept permissive (only `action` is required)
 /// because the parameter set is action-dependent; the detailed contract lives
-/// in [`DESCRIPTION`]. Validation happens during `from_value` against
+/// in [`description`]. Validation happens during `from_value` against
 /// [`ComputerAction`].
 fn schema() -> serde_json::Value {
     serde_json::json!({
