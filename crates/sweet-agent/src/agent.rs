@@ -85,6 +85,13 @@ pub struct Agent<M: Model> {
     /// Run-scoped permission state - mode plus session-level approvals.
     /// Shared via `Arc` so it survives agent switches mid-run.
     permission: Arc<PermissionState>,
+    /// Cap on how many tool-result images are sent to the model each turn: only
+    /// the most recent N images carried on `Role::Tool` messages are kept in the
+    /// outgoing request; older ones are dropped (from the request only - the
+    /// session keeps the full history). `None` sends every image. Set this for
+    /// agents whose tools return a fresh screenshot each turn (computer use),
+    /// where re-sending every past screenshot would balloon context and cost.
+    max_tool_result_images: Option<usize>,
 }
 
 impl<M: Model> Agent<M> {
@@ -100,6 +107,7 @@ impl<M: Model> Agent<M> {
             hooks: HookDispatcher::new(),
             shareable_model: None,
             permission: Arc::new(PermissionState::default()),
+            max_tool_result_images: None,
         }
     }
 
@@ -118,6 +126,21 @@ impl<M: Model> Agent<M> {
     /// session, this survives history compaction.
     pub fn with_dynamic_prompt(mut self, prompt: Arc<dyn DynamicPrompt>) -> Self {
         self.dynamic_prompts.push(prompt);
+        self
+    }
+
+    /// Bound how many tool-result images are sent to the model: on each turn
+    /// only the most recent `max` images carried on `Role::Tool` messages are
+    /// kept in the outgoing request; older ones are dropped (their text - active
+    /// app, accessibility tree, on-disk screenshot path - is retained). The
+    /// session keeps the full transcript; this caps only what each request
+    /// carries.
+    ///
+    /// Unset by default (every image is sent). Set this for agents using a tool
+    /// that returns a fresh screenshot each turn (e.g. computer use), where
+    /// re-sending every past screenshot on every turn balloons context and cost.
+    pub fn with_max_tool_result_images(mut self, max: usize) -> Self {
+        self.max_tool_result_images = Some(max);
         self
     }
 
@@ -597,6 +620,9 @@ impl<M: Model> Agent<M> {
             messages.push(Message::system(instructions));
         }
         messages.extend(self.session.messages());
+        if let Some(limit) = self.max_tool_result_images {
+            cap_tool_result_images(&mut messages, limit);
+        }
         messages
     }
 
@@ -850,6 +876,7 @@ impl Agent<Arc<dyn Model>> {
             hooks: HookDispatcher::new(),
             shareable_model: Some(shareable),
             permission: Arc::new(PermissionState::default()),
+            max_tool_result_images: None,
         }
     }
 }
@@ -942,6 +969,41 @@ fn tool_result_to_message(
     }
 }
 
+/// Keep image blocks on only the most recent `limit` tool-result images,
+/// stripping older ones in place. Scans messages newest-first so the freshest
+/// screenshots survive; non-`Tool` messages (including user-supplied images) are
+/// never touched. Stripping leaves each tool result's text intact; if a result
+/// was image-only and loses all its images, a short placeholder replaces them so
+/// the request never carries an empty tool message.
+///
+/// This bounds context for tools that return a fresh screenshot every turn
+/// (computer use): without it every past screenshot is re-encoded and re-sent on
+/// every turn. Operates on the per-request message list, not the session.
+fn cap_tool_result_images(messages: &mut [Message], limit: usize) {
+    let mut kept = 0usize;
+    for msg in messages.iter_mut().rev() {
+        if msg.role != Role::Tool {
+            continue;
+        }
+        let mut had_image = false;
+        msg.content.retain(|block| {
+            if matches!(block, ContentBlock::Image { .. }) {
+                had_image = true;
+                let keep = kept < limit;
+                kept += usize::from(keep);
+                keep
+            } else {
+                true
+            }
+        });
+        if had_image && msg.content.is_empty() {
+            msg.content.push(ContentBlock::text(
+                "[earlier screenshot omitted to bound context]",
+            ));
+        }
+    }
+}
+
 fn json_string<T: serde::Serialize + ?Sized>(value: &T) -> String {
     serde_json::to_string(value)
         .unwrap_or_else(|e| format!("observability serialization failed: {e}"))
@@ -985,6 +1047,7 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
     use sweet_core::message::ToolCall;
+    use sweet_core::tool::ToolHandler;
 
     #[tokio::test]
     async fn step_appends_user_then_assistant() {
@@ -1310,6 +1373,142 @@ mod tests {
         assert_eq!(h[2].role, Role::Tool);
         assert_eq!(h[2].tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(h[2].text_content(), "{\n  \"msg\": \"hello\"\n}");
+    }
+
+    /// A tool returning an image via `call_rich` (e.g. a screenshot). The image
+    /// rides on a tool-result message; the text-only `call` path drops it.
+    struct ImageTool;
+
+    #[async_trait]
+    impl ToolHandler for ImageTool {
+        async fn call(&self, _args: serde_json::Value) -> std::result::Result<String, ToolError> {
+            Ok("snapshot".to_string())
+        }
+
+        async fn call_rich(
+            &self,
+            _args: serde_json::Value,
+        ) -> std::result::Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("snapshot").with_image(vec![1, 2, 3], "image/png"))
+        }
+    }
+
+    fn image_tool() -> ToolSpec {
+        ToolSpec::new(
+            "shoot",
+            "take a screenshot",
+            serde_json::json!({"type": "object"}),
+            ImageTool,
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_image_output_is_persisted_to_session() {
+        // The agent dispatches via `call_rich`, so an image a tool returns must
+        // survive onto the `Role::Tool` session message (not just its text).
+        let model = MockModel::with_scripted([
+            MockModel::reply_tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                name: "shoot".into(),
+                arguments: serde_json::json!({}),
+            }]),
+            MockModel::reply_text("done"),
+        ]);
+        let mut agent = Agent::new(model).with_tool(image_tool());
+        agent.step("go").await.unwrap();
+
+        let h = agent.session().messages();
+        let tool_msg = h
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool result");
+        assert!(tool_msg.has_images(), "image block dropped during dispatch");
+        assert_eq!(tool_msg.text_content(), "snapshot");
+    }
+
+    #[test]
+    fn cap_tool_result_images_keeps_only_most_recent() {
+        let img = || ContentBlock::Image {
+            data: vec![0u8; 4],
+            media_type: "image/png".into(),
+        };
+        let tool_with_image =
+            |id: &str| Message::tool_result_blocks(id, vec![ContentBlock::text("shot"), img()]);
+        let mut messages = vec![
+            Message::user("go"),
+            tool_with_image("a"),
+            tool_with_image("b"),
+            tool_with_image("c"),
+        ];
+        cap_tool_result_images(&mut messages, 1);
+        // Only the newest tool result keeps its image; older ones keep text.
+        assert!(!messages[1].has_images());
+        assert!(!messages[2].has_images());
+        assert!(messages[3].has_images());
+        assert_eq!(messages[1].text_content(), "shot");
+    }
+
+    #[test]
+    fn cap_tool_result_images_placeholder_when_image_only() {
+        // An image-only tool result that loses its image must not become empty.
+        let mut messages = vec![
+            Message::tool_result_blocks(
+                "a",
+                vec![ContentBlock::Image {
+                    data: vec![0u8; 4],
+                    media_type: "image/png".into(),
+                }],
+            ),
+            Message::tool_result_blocks(
+                "b",
+                vec![ContentBlock::Image {
+                    data: vec![0u8; 4],
+                    media_type: "image/png".into(),
+                }],
+            ),
+        ];
+        cap_tool_result_images(&mut messages, 1);
+        assert!(!messages[0].has_images());
+        assert!(!messages[0].content.is_empty(), "empty tool result");
+        assert!(messages[1].has_images());
+    }
+
+    #[test]
+    fn cap_tool_result_images_ignores_user_images() {
+        // User-supplied images are never stripped, even past the limit.
+        let mut messages = vec![Message::user_blocks(vec![ContentBlock::Image {
+            data: vec![0u8; 4],
+            media_type: "image/png".into(),
+        }])];
+        cap_tool_result_images(&mut messages, 0);
+        assert!(messages[0].has_images());
+    }
+
+    #[tokio::test]
+    async fn build_messages_applies_image_cap() {
+        // The cap is wired through `build_messages`: with a limit of 1, only the
+        // most recent screenshot tool result reaches the model.
+        let mut agent = Agent::new(MockModel::with_replies(["x"]))
+            .with_tool(image_tool())
+            .with_max_tool_result_images(1);
+        for id in ["a", "b"] {
+            agent
+                .session
+                .push(MemoryItem::Message(Message::tool_result_blocks(
+                    id,
+                    vec![
+                        ContentBlock::text("shot"),
+                        ContentBlock::Image {
+                            data: vec![0u8; 4],
+                            media_type: "image/png".into(),
+                        },
+                    ],
+                )))
+                .unwrap();
+        }
+        let built = agent.build_messages();
+        let imaged = built.iter().filter(|m| m.has_images()).count();
+        assert_eq!(imaged, 1, "only the most recent tool image should be sent");
     }
 
     #[tokio::test]
