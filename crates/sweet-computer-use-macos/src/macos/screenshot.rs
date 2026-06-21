@@ -164,7 +164,9 @@ fn fill_rect(img: &mut image::RgbaImage, x: i64, y: i64, w: i64, h: i64, color: 
 fn encode_png(image: CGImageRef) -> Result<Vec<u8>, ComputerUseError> {
     let data = CfBox::from_create(unsafe { ffi::CFDataCreateMutable(std::ptr::null(), 0) })
         .ok_or_else(|| ComputerUseError::Platform("CFDataCreateMutable failed".into()))?;
-    let png_type = ffi::cfstr("public.png");
+    let png_type = ffi::cfstr("public.png").ok_or_else(|| {
+        ComputerUseError::Platform("CFStringCreateWithBytes failed for public.png".into())
+    })?;
 
     let dest = CfBox::from_create(unsafe {
         ffi::CGImageDestinationCreateWithData(data.as_ptr(), png_type.as_ptr(), 1, std::ptr::null())

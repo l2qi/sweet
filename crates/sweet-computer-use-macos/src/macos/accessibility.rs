@@ -125,7 +125,9 @@ pub fn press(path: &str) -> Result<(), ComputerUseError> {
         .window
         .as_ref()
         .ok_or_else(|| ComputerUseError::ElementNotFound("no focused window".to_string()))?;
-    let action = ffi::cfstr("AXPress");
+    let action = ffi::cfstr("AXPress").ok_or_else(|| {
+        ComputerUseError::Platform("CFStringCreateWithBytes failed for AXPress".into())
+    })?;
     let res = with_element(window.as_ptr(), path, |el| unsafe {
         ffi::AXUIElementPerformAction(el, action.as_ptr())
     });
@@ -146,8 +148,12 @@ pub fn set_value(path: &str, value: &str) -> Result<(), ComputerUseError> {
         .window
         .as_ref()
         .ok_or_else(|| ComputerUseError::ElementNotFound("no focused window".to_string()))?;
-    let attr = ffi::cfstr("AXValue");
-    let val = ffi::cfstr(value);
+    let attr = ffi::cfstr("AXValue").ok_or_else(|| {
+        ComputerUseError::Platform("CFStringCreateWithBytes failed for AXValue".into())
+    })?;
+    let val = ffi::cfstr(value).ok_or_else(|| {
+        ComputerUseError::Platform("CFStringCreateWithBytes failed for value string".into())
+    })?;
     let res = with_element(window.as_ptr(), path, |el| unsafe {
         ffi::AXUIElementSetAttributeValue(el, attr.as_ptr(), val.as_ptr())
     });

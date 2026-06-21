@@ -8,6 +8,7 @@ description = "macOS computer-use backend (accessibility tree, Quartz input even
 
 [dependencies]
 sweet-computer-use-core = { path = "../sweet-computer-use-core" }
+sweet-core = { path = "../sweet-core" }
 async-trait = { workspace = true }
 # `tokio::time::sleep` drives the provider's async `act` for `Wait` (so a pause
 # yields instead of blocking the executor). Only the `time` feature is needed;

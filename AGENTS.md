@@ -14,6 +14,7 @@ Sweet is an async, trait-based AI agent framework for Rust. It provides:
 - **Long-term memory** (`sweet-memory`): SQLite store with hybrid FTS5 + embedding recall, memory tools
 - **OS sandboxing** (`sweet-sandbox`): macOS Seatbelt, Linux Bubblewrap
 - **MCP integration** (`sweet-mcp`): MCP tool provider via the `rmcp` SDK
+- **Computer use** (`sweet-computer-use-core`, `sweet-computer-use-macos`): a platform-neutral GUI-action vocabulary, a provider trait, and the `computer` tool; a macOS backend over the accessibility tree, Quartz events, and screen capture
 
 Dependency direction (one-way — never reverse):
 ```
@@ -24,6 +25,8 @@ sweet-session  → sweet-core
 sweet-memory   → sweet-core
 sweet-tools    → sweet-core (with "derive" feature)
 sweet-sandbox  → sweet-core
+sweet-computer-use-core     → sweet-core
+sweet-computer-use-macos    → sweet-computer-use-core, sweet-core (CommandRunner for open_app; macOS FFI is standalone)
 sweet-tool-derive → (standalone proc-macro, no sweet deps)
 sweet-mcp-mock-server → rmcp (test fixture only)
 ```
@@ -255,6 +258,31 @@ Feature flags:
 ### sweet-mcp-mock-server
 
 Test-fixture binary (`publish = false`). Exposes `echo` and `add` tools over stdio and Streamable HTTP. Not shipped — built only during CI as a hermetic test dependency.
+
+### sweet-computer-use-core
+
+Platform-neutral computer-use substrate. Defines the bounded `ComputerAction` set a model can request, the structured `ComputerObservation` a platform reports back, the `ComputerUseProvider` trait a backend implements, and the single model-facing `computer_use_tool` that bridges the two. It knows nothing about macOS, Quartz, or accessibility APIs - that lives behind the provider trait.
+
+Public surface: `ComputerAction`, `MouseButton`, `Point`, `ActionOutcome`, `ComputerObservation`, `ObserveOptions`, `PixelRect`, `Rect`, `Screenshot`, `Size`, `UiNode`, `WindowInfo`, `crosshair_rects`, `render_observation`, `render_outcome`, `ComputerUseError`, `ComputerUseProvider`, `SharedProvider`, `computer_use_tool`, `CoordinateSpace`, `COMPUTER_TOOL_NAME`.
+
+- Observations are text-first (active app, window list, accessibility tree with exact frames) with an optional screenshot attached as an image block via `ToolOutput` (`call_rich`). The `Observe` and `Screenshot` actions are routed to `observe`; every other variant goes to `act`.
+- Coordinate mapping is owned by the harness, not the model: `CoordinateSpace` (`Absolute` or `Normalized { grid }`) maps model coordinates to display pixels, and coordinates are clamped on-screen in both spaces.
+- No Cargo features.
+
+### sweet-computer-use-macos
+
+macOS backend implementing `ComputerUseProvider`. Talks directly to the platform C APIs via hand-written `extern "C"` FFI (`macos::ffi`), linked in `build.rs`:
+
+- Accessibility (`AXUIElement`, ApplicationServices): the focused window's element tree, plus `AXPress`/`AXValue` actions.
+- Quartz Event Services (`CGEvent`, CoreGraphics): synthetic mouse, keyboard, and scroll input.
+- CoreGraphics display + window list, and ImageIO PNG screen capture.
+
+Public surface: `MacComputerUse`.
+
+- Everything platform-specific is `#[cfg(target_os = "macos")]`; on other targets the crate still builds and `MacComputerUse` reports `ComputerUseError::Unsupported`.
+- Observing the accessibility tree and posting synthetic input require the **Accessibility** TCC grant; screen capture requires **Screen Recording**. Missing grants fail with `ComputerUseError::PermissionDenied` naming the System Settings pane.
+- `Wait` is resolved in the async provider via `tokio::time::sleep` (non-blocking); `open_app` goes through the injected `CommandRunner` (`DirectRunner` by default, overridable via `with_command_runner`) with the model-controlled app name shell-quoted to prevent injection.
+- No Cargo features.
 
 ## What to update when you change things
 

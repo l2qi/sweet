@@ -2082,6 +2082,7 @@ dependencies = [
  "async-trait",
  "image",
  "sweet-computer-use-core",
+ "sweet-core",
  "tokio",
 ]
 

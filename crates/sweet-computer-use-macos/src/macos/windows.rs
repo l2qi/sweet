@@ -63,7 +63,9 @@ pub fn list_windows(active_pid: Option<Pid>) -> Vec<WindowInfo> {
 
 /// Borrowed lookup into a CG window dictionary (the value is owned by the dict).
 fn dict_get(dict: ffi::CFDictionaryRef, key: &str) -> ffi::CFTypeRef {
-    let k = ffi::cfstr(key);
+    let Some(k) = ffi::cfstr(key) else {
+        return std::ptr::null();
+    };
     unsafe { ffi::CFDictionaryGetValue(dict, k.as_ptr()) }
 }
 

@@ -265,10 +265,9 @@ pub(crate) fn convert_messages(
                     .collect();
                 parts.push(Part {
                     function_response: Some(FunctionResponse {
-                        name: name.clone(),
+                        name,
                         response: serde_json::json!({
-                            "name": name,
-                            "content": tool_msg.text_content(),
+                            "result": tool_msg.text_content(),
                         }),
                         parts: response_parts,
                     }),
@@ -473,7 +472,7 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // convert_messages - tool results map to a `functionResponse` whose
-    // `response` is `{ name, content }` (the documented Gemini shape).
+    // `response` is `{ result: ... }` (the documented Gemini convention).
     // ---------------------------------------------------------------------
 
     fn tool_msg(id: &str, content: &str) -> Message {
@@ -481,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_response_uses_name_and_content() {
+    fn tool_result_response_uses_result_key() {
         let mut names = HashMap::new();
         names.insert("call_1".to_string(), "echo".to_string());
 
@@ -492,7 +491,7 @@ mod tests {
         let resp = part.function_response.as_ref().unwrap();
         assert_eq!(
             resp.response,
-            serde_json::json!({ "name": "echo", "content": "hello world" })
+            serde_json::json!({ "result": "hello world" })
         );
         assert_eq!(resp.name, "echo");
     }
@@ -523,7 +522,7 @@ mod tests {
         let resp = contents[0].parts[0].function_response.as_ref().unwrap();
         assert_eq!(
             resp.response,
-            serde_json::json!({ "name": "computer", "content": "Screenshot captured" })
+            serde_json::json!({ "result": "Screenshot captured" })
         );
         // The image is nested in the response's `parts` as inlineData.
         assert_eq!(resp.parts.len(), 1);
@@ -541,7 +540,7 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         let fr = &json["contents"][0]["parts"][0]["functionResponse"];
         assert_eq!(fr["parts"][0]["inlineData"]["mimeType"], "image/png");
-        assert_eq!(fr["response"]["content"], "Screenshot captured");
+        assert_eq!(fr["response"]["result"], "Screenshot captured");
     }
 
     #[test]
@@ -572,7 +571,7 @@ mod tests {
         let resp = contents[0].parts[0].function_response.as_ref().unwrap();
         assert_eq!(
             resp.response,
-            serde_json::json!({ "name": "echo", "content": "part-apart-b" })
+            serde_json::json!({ "result": "part-apart-b" })
         );
     }
 
@@ -590,17 +589,11 @@ mod tests {
         assert_eq!(contents[0].parts.len(), 2);
 
         let r1 = contents[0].parts[0].function_response.as_ref().unwrap();
-        assert_eq!(
-            r1.response,
-            serde_json::json!({ "name": "a", "content": "r1" })
-        );
+        assert_eq!(r1.response, serde_json::json!({ "result": "r1" }));
         assert_eq!(r1.name, "a");
 
         let r2 = contents[0].parts[1].function_response.as_ref().unwrap();
-        assert_eq!(
-            r2.response,
-            serde_json::json!({ "name": "b", "content": "r2" })
-        );
+        assert_eq!(r2.response, serde_json::json!({ "result": "r2" }));
         assert_eq!(r2.name, "b");
     }
 
@@ -612,10 +605,7 @@ mod tests {
         let (_, contents) = convert_messages(&msgs, &HashMap::new(), &HashMap::new());
         let resp = contents[0].parts[0].function_response.as_ref().unwrap();
         assert_eq!(resp.name, "");
-        assert_eq!(
-            resp.response,
-            serde_json::json!({ "name": "", "content": "data" })
-        );
+        assert_eq!(resp.response, serde_json::json!({ "result": "data" }));
     }
 
     #[test]
@@ -636,8 +626,8 @@ mod tests {
             tool_config: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        let content = &json["contents"][0]["parts"][0]["functionResponse"]["response"]["content"];
-        assert_eq!(content, &serde_json::Value::String("ok".to_string()));
+        let result = &json["contents"][0]["parts"][0]["functionResponse"]["response"]["result"];
+        assert_eq!(result, &serde_json::Value::String("ok".to_string()));
     }
 
     #[test]

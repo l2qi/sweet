@@ -281,10 +281,11 @@ impl Drop for CfBox {
 
 /// Create an owned `CFString` from a Rust string slice.
 ///
-/// Panics only on the impossible case of CoreFoundation rejecting valid UTF-8
-/// bytes - every call site passes a literal attribute/key name or model-given
-/// text, so a null here would be an unrecoverable platform invariant break.
-pub fn cfstr(s: &str) -> CfBox {
+/// Returns `None` only on the (practically impossible) case of CoreFoundation
+/// rejecting valid UTF-8 bytes. Every call site passes a literal attribute/key
+/// name or model-given text, so callers convert the `None` into a
+/// [`ComputerUseError`] (or propagate it) rather than panicking.
+pub fn cfstr(s: &str) -> Option<CfBox> {
     // Safety: bytes/length describe a valid UTF-8 buffer; allocator is default.
     let p = unsafe {
         CFStringCreateWithBytes(
@@ -295,7 +296,7 @@ pub fn cfstr(s: &str) -> CfBox {
             0,
         )
     };
-    CfBox::from_create(p).expect("CFStringCreateWithBytes returned null for valid UTF-8")
+    CfBox::from_create(p)
 }
 
 /// Copy a `CFString`'s contents into a Rust `String`.
@@ -356,7 +357,7 @@ pub fn is_ax_value(cf: CFTypeRef) -> bool {
 /// Copy an accessibility attribute, returning the owned value (or `None` if the
 /// attribute is unsupported / empty).
 pub fn copy_attr(el: AXUIElementRef, attr: &str) -> Option<CfBox> {
-    let key = cfstr(attr);
+    let key = cfstr(attr)?;
     let mut value: CFTypeRef = std::ptr::null();
     // Safety: `el` and the attribute string are valid; `value` is an out-param.
     let err = unsafe { AXUIElementCopyAttributeValue(el, key.as_ptr(), &mut value) };
