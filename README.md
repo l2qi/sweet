@@ -61,9 +61,10 @@ async fn main() -> anyhow::Result<()> {
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `openai` | yes | OpenAI and OpenAI-compatible providers (`OpenAIProvider`, `CerebrasProvider`) + `OpenAIEmbedder` |
+| `openai` | yes | OpenAI and OpenAI-compatible providers (`OpenAIProvider`) + `OpenAIEmbedder` |
 | `gemini` | yes | Google Gemini provider + `GeminiEmbedder` |
 | `anthropic` | yes | Anthropic Claude provider |
+| `cerebras` | yes | Cerebras provider (`CerebrasProvider`); implies `openai` |
 
 ### sweet-tools
 

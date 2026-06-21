@@ -287,6 +287,13 @@ impl OpenAIProvider {
         self.thinking.is_some()
     }
 
+    /// The `User-Agent` header value. Used by [`CerebrasProvider`](crate::CerebrasProvider)
+    /// tests to assert the override forwards to the inner transport.
+    #[cfg(test)]
+    pub(crate) fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
     fn wire_messages<'a>(&self, messages: &'a [Message]) -> Vec<WireMessage<'a>> {
         let include_reasoning = self.echo_reasoning();
         let mut out: Vec<WireMessage<'a>> = Vec::with_capacity(messages.len());
