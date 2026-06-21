@@ -9,6 +9,10 @@ description = "macOS computer-use backend (accessibility tree, Quartz input even
 [dependencies]
 sweet-computer-use-core = { path = "../sweet-computer-use-core" }
 async-trait = { workspace = true }
+# `tokio::time::sleep` drives the provider's async `act` for `Wait` (so a pause
+# yields instead of blocking the executor). Only the `time` feature is needed;
+# the runtime itself is driven by the host binary.
+tokio = { workspace = true, features = ["time"] }
 
 # Screen capture downscaling (resizing the pixel capture to the display's point
 # size) is macOS-only; other targets build the Unsupported stub and need none of

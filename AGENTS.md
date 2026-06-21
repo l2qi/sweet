@@ -185,17 +185,17 @@ Feature flags:
 
 ### sweet-llm
 
-Public surface: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `OpenAIEmbedder`, `GeminiEmbedder`, `ProviderError`. Per-provider thinking config: `openai::ThinkingMode`, `openai::ReasoningContent`, `anthropic::ThinkingConfig`.
+Public surface: `OpenAIProvider`, `GeminiProvider`, `AnthropicProvider`, `CerebrasProvider`, `OpenAIEmbedder`, `GeminiEmbedder`, `ReasoningConfig`, `SamplingConfig`, `ToolChoice`, `StructuredOutput`, `ProviderError`. Reasoning is configured via the cross-provider `ReasoningConfig` (Toggle/Effort/Budget); each provider's `with_reasoning` maps each variant to a single wire shape. **The provider never sniffs the model name** - where a model family needs a different wire encoding, the caller (which owns the catalog) expresses it by choosing the variant: Anthropic `Toggle(true)` -> `{type: adaptive}` (Claude 4.6+) while older models take an explicit `Budget`; Gemini `Effort` -> `thinkingLevel` (Gemini 3+) while 2.5 takes a `Budget`.
 
-- `OpenAIProvider` supports thinking-mode models via OpenAI-compatible wire format.
-- `AnthropicProvider` supports native thinking blocks; configure with `AnthropicProvider::with_thinking(ThinkingConfig)`.
-- Embedders follow the provider builder pattern (`new`, `from_env`, `with_base_url`, `with_model`). No Anthropic embedder — Anthropic has no embeddings API (their docs point at Voyage AI).
+- `OpenAIProvider` exposes reasoning via `reasoning_effort` and a `thinking` object (`with_reasoning`); `openai::ReasoningContent` is the reasoning-history replay abstraction.
+- `AnthropicProvider` supports native thinking blocks; configure reasoning with `with_reasoning`.
+- Embedders follow the provider builder pattern (`new`, `from_env`, `with_base_url`, `with_model`). No Anthropic embedder - Anthropic has no embeddings API (their docs point at Voyage AI).
 
 Feature flags:
 
 | Flag | Pulls in |
 |------|---------|
-| `openai` | `OpenAIProvider`, `OpenAIEmbedder` |
+| `openai` | `OpenAIProvider`, `OpenAIEmbedder`, `CerebrasProvider` |
 | `gemini` | `GeminiProvider`, `GeminiEmbedder` |
 | `anthropic` | `AnthropicProvider` |
 | (default) | all of the above |

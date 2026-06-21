@@ -177,7 +177,11 @@ impl GeminiProvider {
     ///   (`thinkingBudget: -1`, `includeThoughts: true`).
     /// - [`Toggle(false)`](ReasoningConfig::Toggle) -> thinking off
     ///   (`thinkingBudget: 0`).
-    /// - [`Effort(e)`](ReasoningConfig::Effort) -> `thinkingLevel: e` (Gemini 3+).
+    /// - [`Effort(e)`](ReasoningConfig::Effort) -> discrete `thinkingLevel`
+    ///   (`minimal`/`low`/`medium`/`high`; Gemini 3+). Models that only accept a
+    ///   numeric budget (Gemini 2.5 and earlier) should be sent an explicit
+    ///   [`Budget`](ReasoningConfig::Budget) instead - which variant a model
+    ///   wants is the caller's catalog knowledge, never sniffed here.
     /// - [`Budget(n)`](ReasoningConfig::Budget) -> `thinkingBudget: n`.
     pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
         self.reasoning = Some(config);
@@ -191,10 +195,6 @@ impl GeminiProvider {
     /// Build the Gemini `thinkingConfig`, or `None` when reasoning is unset.
     fn thinking_config(&self) -> Option<wire::ThinkingConfig> {
         let config = self.reasoning.as_ref()?;
-        // The effort dialect maps differently per model generation: Gemini 3
-        // exposes a discrete `thinkingLevel`, while Gemini 2.5 only takes a
-        // numeric `thinkingBudget` (sending `thinkingLevel` there is rejected).
-        let is_gemini_3 = self.model.contains("gemini-3");
         Some(match config {
             ReasoningConfig::Toggle(true) => wire::ThinkingConfig {
                 thinking_budget: Some(-1),
@@ -206,15 +206,14 @@ impl GeminiProvider {
                 include_thoughts: None,
                 thinking_level: None,
             },
-            ReasoningConfig::Effort(e) if is_gemini_3 => wire::ThinkingConfig {
+            // Effort maps to the discrete `thinkingLevel` knob (Gemini 3+).
+            // Models that only accept a numeric budget (Gemini 2.5) take an
+            // explicit `Budget` from the caller instead; the provider does not
+            // sniff the model name.
+            ReasoningConfig::Effort(e) => wire::ThinkingConfig {
                 thinking_budget: None,
                 include_thoughts: Some(true),
                 thinking_level: Some(normalize_thinking_level(e)),
-            },
-            ReasoningConfig::Effort(e) => wire::ThinkingConfig {
-                thinking_budget: Some(effort_to_budget(e)),
-                include_thoughts: Some(true),
-                thinking_level: None,
             },
             ReasoningConfig::Budget(n) => wire::ThinkingConfig {
                 thinking_budget: Some(*n as i32),
@@ -520,17 +519,6 @@ fn normalize_thinking_level(effort: &str) -> String {
     }
 }
 
-/// Map an effort level to a Gemini 2.5 `thinkingBudget` (token count). Values
-/// stay within both Flash (0-24576) and Pro (128-32768) budget ranges.
-fn effort_to_budget(effort: &str) -> i32 {
-    match effort {
-        "none" => 0,
-        "low" => 4096,
-        "high" | "xhigh" | "max" => 16384,
-        _ => 8192, // medium / unknown
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,24 +569,13 @@ mod tests {
 
     #[test]
     fn effort_emits_thinking_level() {
+        // `Effort` maps to the discrete `thinkingLevel` (Gemini 3+); no model
+        // name is sniffed. Gemini 2.5 callers send an explicit `Budget` instead.
         let p = GeminiProvider::new("k").with_reasoning(ReasoningConfig::Effort("high".into()));
         let body = p.build_request_body(&[], &[]).unwrap();
-        assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "high"
-        );
-    }
-
-    #[test]
-    fn effort_on_gemini_25_emits_thinking_budget() {
-        // Gemini 2.5 has no `thinkingLevel`; effort maps to a numeric budget.
-        let p = GeminiProvider::new("k")
-            .with_model("gemini-2.5-flash")
-            .with_reasoning(ReasoningConfig::Effort("high".into()));
-        let body = p.build_request_body(&[], &[]).unwrap();
         let tc = &body["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
-        assert!(tc.get("thinkingLevel").is_none());
+        assert_eq!(tc["thinkingLevel"], "high");
+        assert!(tc.get("thinkingBudget").is_none());
     }
 
     #[test]

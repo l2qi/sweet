@@ -28,9 +28,6 @@ pub const DEFAULT_MAX_TOKENS: usize = 4096;
 pub const API_VERSION: &str = "2023-06-01";
 /// Anthropic requires extended-thinking budgets of at least 1024 tokens.
 const MIN_THINKING_BUDGET: usize = 1024;
-/// Budget used when enabling thinking on a pre-4.6 model via the toggle dialect
-/// (those models need an explicit `budget_tokens`, not `{type: adaptive}`).
-const DEFAULT_THINKING_BUDGET: usize = 2048;
 
 /// Inference provider for Anthropic's native `/v1/messages` API.
 #[derive(Debug, Clone)]
@@ -41,27 +38,13 @@ pub struct AnthropicProvider {
     model: String,
     max_tokens: usize,
     user_agent: String,
-    reasoning: Option<AnthropicReasoning>,
+    reasoning: Option<ReasoningConfig>,
     sampling: SamplingConfig,
     prompt_caching: bool,
     tool_choice: Option<ToolChoice>,
     structured_output: Option<StructuredOutput>,
     auth_token: Option<String>,
     extra_betas: Vec<String>,
-}
-
-/// How reasoning was configured for an [`AnthropicProvider`], translated to the
-/// wire `thinking` object and/or top-level `effort` field at request time.
-#[derive(Debug, Clone)]
-enum AnthropicReasoning {
-    /// `thinking: {type: adaptive}` (Sonnet 4.6 / Opus 4.6+).
-    Adaptive,
-    /// `thinking: {type: enabled, budget_tokens: n}`.
-    Budget(u32),
-    /// Top-level `effort` (e.g. `low`/`medium`/`high`); no `thinking` object.
-    Effort(String),
-    /// `thinking: {type: disabled}`.
-    Off,
 }
 
 /// Resolved sampling fields for one request (after Anthropic's clamps).
@@ -208,19 +191,18 @@ impl AnthropicProvider {
         self
     }
 
-    /// Configure reasoning for this provider.
+    /// Configure reasoning for this provider. The provider never sniffs the
+    /// model name; the caller picks the variant the configured model accepts.
     ///
-    /// - [`Toggle(true)`](ReasoningConfig::Toggle) -> `thinking: {type: adaptive}`.
+    /// - [`Toggle(true)`](ReasoningConfig::Toggle) -> `thinking: {type: adaptive}`,
+    ///   the modern Claude 4.6+ shape. Models that reject adaptive thinking
+    ///   should be sent an explicit [`Budget`](ReasoningConfig::Budget) instead.
     /// - [`Toggle(false)`](ReasoningConfig::Toggle) -> `thinking: {type: disabled}`.
-    /// - [`Budget(n)`](ReasoningConfig::Budget) -> `thinking: {type: enabled, budget_tokens: n}`.
+    /// - [`Budget(n)`](ReasoningConfig::Budget) -> `thinking: {type: enabled, budget_tokens: n}`
+    ///   (sent verbatim, clamped only to Anthropic's `1024 <= b < max_tokens` rule).
     /// - [`Effort(e)`](ReasoningConfig::Effort) -> `output_config: {effort: e}` (no `thinking` object).
     pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
-        self.reasoning = Some(match config {
-            ReasoningConfig::Toggle(true) => AnthropicReasoning::Adaptive,
-            ReasoningConfig::Toggle(false) => AnthropicReasoning::Off,
-            ReasoningConfig::Budget(n) => AnthropicReasoning::Budget(n),
-            ReasoningConfig::Effort(e) => AnthropicReasoning::Effort(e),
-        });
+        self.reasoning = Some(config);
         self
     }
 
@@ -238,34 +220,20 @@ impl AnthropicProvider {
 
     fn wire_thinking(&self) -> Option<WireThinking> {
         let reasoning = self.reasoning.as_ref()?;
-        let adaptive = supports_adaptive_thinking(&self.model);
         Some(match reasoning {
-            AnthropicReasoning::Off => WireThinking::Disabled,
-            // The effort dialect rides on `output_config`, not `thinking`.
-            AnthropicReasoning::Effort(_) => return None,
-            // Toggle-on: adaptive on 4.6+, an explicit budget on older models
-            // (which don't accept `{type: adaptive}`).
-            AnthropicReasoning::Adaptive => {
-                if adaptive {
-                    WireThinking::Adaptive
-                } else {
-                    WireThinking::Enabled {
-                        budget_tokens: self.thinking_budget(),
-                    }
-                }
-            }
-            // A concrete budget is honored on models that accept it; newer
-            // models (opus 4.7/4.8, fable) 400 on `budget_tokens`, so they fall
-            // back to adaptive thinking instead.
-            AnthropicReasoning::Budget(_) => {
-                if rejects_budget_tokens(&self.model) {
-                    WireThinking::Adaptive
-                } else {
-                    WireThinking::Enabled {
-                        budget_tokens: self.thinking_budget(),
-                    }
-                }
-            }
+            ReasoningConfig::Toggle(false) => WireThinking::Disabled,
+            // Effort rides on `output_config`, not `thinking`.
+            ReasoningConfig::Effort(_) => return None,
+            // `Toggle(true)` ("reasoning on") maps to adaptive thinking, the
+            // modern Claude 4.6+ shape. Models that reject `{type: adaptive}`
+            // must be sent an explicit budget by the caller; the provider never
+            // rewrites based on the model name.
+            ReasoningConfig::Toggle(true) => WireThinking::Adaptive,
+            // An explicit budget is emitted verbatim, clamped only to
+            // Anthropic's hard `1024 <= b < max_tokens` rule.
+            ReasoningConfig::Budget(_) => WireThinking::Enabled {
+                budget_tokens: self.thinking_budget(),
+            },
         })
     }
 
@@ -273,7 +241,7 @@ impl AnthropicProvider {
     /// and/or the structured-output `format` schema. `None` when neither is set.
     fn wire_output_config(&self) -> Option<OutputConfig<'_>> {
         let effort = match self.reasoning.as_ref() {
-            Some(AnthropicReasoning::Effort(e)) => Some(e.as_str()),
+            Some(ReasoningConfig::Effort(e)) => Some(e.as_str()),
             _ => None,
         };
         let format = self.structured_output.as_ref().map(|so| {
@@ -287,24 +255,18 @@ impl AnthropicProvider {
         Some(OutputConfig { effort, format })
     }
 
-    /// The thinking-token budget to send, clamped up to Anthropic's 1024-token
-    /// minimum. `0` unless reasoning is the budget dialect.
-    ///
-    /// Anthropic draws thinking *from* `max_tokens` and requires
-    /// `budget_tokens < max_tokens`. Since `max_tokens` is set to the model's
-    /// full output ceiling (models.dev `limit.output`), "add budget then clamp
-    /// to the ceiling" reduces to "use the ceiling" - so `max_tokens` is sent
-    /// unchanged and the budget is carved out of it.
+    /// The thinking-token budget that would be sent, clamped to Anthropic's
+    /// `1024 <= budget_tokens < max_tokens` rule. The upper bound is the
+    /// *request* cap ([`request_max_tokens`](Self::request_max_tokens)), not the
+    /// model ceiling, so a `sampling.max_tokens` override bounds the budget too
+    /// (otherwise `budget_tokens` could exceed `max_tokens` and the API 400s).
+    /// Returns `0` unless reasoning is an explicit [`Budget`](ReasoningConfig::Budget).
     fn thinking_budget(&self) -> usize {
         let requested = match self.reasoning.as_ref() {
-            Some(AnthropicReasoning::Budget(n)) => *n as usize,
-            // Pre-4.6 toggle-on needs an explicit budget; use a sane default.
-            Some(AnthropicReasoning::Adaptive) => DEFAULT_THINKING_BUDGET,
+            Some(ReasoningConfig::Budget(n)) => *n as usize,
             _ => return 0,
         };
-        // Anthropic requires `1024 <= budget_tokens < max_tokens`; `max_tokens`
-        // is the model's output ceiling, so clamp the budget strictly below it.
-        let upper = self.max_tokens.saturating_sub(1);
+        let upper = self.request_max_tokens().saturating_sub(1);
         requested.clamp(MIN_THINKING_BUDGET.min(upper), upper)
     }
 
@@ -765,28 +727,6 @@ enum BlockState {
     Unknown,
 }
 
-/// Whether `model` accepts `thinking: {type: adaptive}` (Claude 4.6 and newer).
-fn supports_adaptive_thinking(model: &str) -> bool {
-    [
-        "opus-4-6",
-        "opus-4-7",
-        "opus-4-8",
-        "sonnet-4-6",
-        "fable",
-        "mythos",
-    ]
-    .iter()
-    .any(|m| model.contains(m))
-}
-
-/// Whether `model` rejects `thinking.budget_tokens` with a 400 (opus 4.7/4.8 and
-/// fable/mythos). These take adaptive thinking instead of an explicit budget.
-fn rejects_budget_tokens(model: &str) -> bool {
-    ["opus-4-7", "opus-4-8", "fable", "mythos"]
-        .iter()
-        .any(|m| model.contains(m))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,25 +750,12 @@ mod tests {
     }
 
     #[test]
-    fn toggle_on_uses_adaptive_thinking_on_46_models() {
-        let p = AnthropicProvider::new("k")
-            .with_model("claude-opus-4-8")
-            .with_reasoning(ReasoningConfig::Toggle(true));
+    fn toggle_on_uses_adaptive_thinking() {
+        // `Toggle(true)` maps to `{type: adaptive}`, the modern Claude shape; no
+        // model name is sniffed. Models without adaptive take an explicit Budget.
+        let p = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Toggle(true));
         assert!(matches!(p.wire_thinking(), Some(WireThinking::Adaptive)));
         assert!(p.wire_output_config().is_none());
-    }
-
-    #[test]
-    fn toggle_on_pre_46_model_uses_enabled_budget() {
-        // Sonnet 4 (pre-4.6) doesn't accept `{type: adaptive}`; toggle-on must
-        // send an explicit budget instead.
-        let p = AnthropicProvider::new("k")
-            .with_model("claude-sonnet-4-20250514")
-            .with_reasoning(ReasoningConfig::Toggle(true));
-        assert!(matches!(
-            p.wire_thinking(),
-            Some(WireThinking::Enabled { .. })
-        ));
     }
 
     #[test]
@@ -890,13 +817,18 @@ mod tests {
     }
 
     #[test]
-    fn budget_on_rejecting_model_falls_back_to_adaptive() {
-        // opus-4-8 returns a 400 on `budget_tokens`; send adaptive instead.
+    fn budget_sent_verbatim() {
+        // An explicit budget is never rewritten by the model name; the caller
+        // owns correctness. `Budget` always produces `{type: enabled, budget_tokens}`.
         let p = AnthropicProvider::new("k")
-            .with_model("claude-opus-4-8")
             .with_max_tokens(64_000)
             .with_reasoning(ReasoningConfig::Budget(8_000));
-        assert!(matches!(p.wire_thinking(), Some(WireThinking::Adaptive)));
+        assert!(matches!(
+            p.wire_thinking(),
+            Some(WireThinking::Enabled {
+                budget_tokens: 8_000
+            })
+        ));
     }
 
     #[test]
@@ -905,6 +837,22 @@ mod tests {
         let p = AnthropicProvider::new("k").with_reasoning(ReasoningConfig::Budget(50_000));
         assert!(p.thinking_budget() < p.max_tokens());
         assert_eq!(p.thinking_budget(), p.max_tokens() - 1);
+    }
+
+    #[test]
+    fn budget_clamped_below_sampling_max_tokens_override() {
+        // The budget is clamped against the *request* cap, not the model
+        // ceiling: a low `sampling.max_tokens` must bound the budget too, else
+        // Anthropic rejects `budget_tokens >= max_tokens` with a 400.
+        let p = AnthropicProvider::new("k")
+            .with_max_tokens(64_000)
+            .with_sampling(SamplingConfig {
+                max_tokens: Some(1000),
+                ..Default::default()
+            })
+            .with_reasoning(ReasoningConfig::Budget(8_000));
+        assert!(p.thinking_budget() < 1000);
+        assert_eq!(p.thinking_budget(), 999);
     }
 
     #[test]
@@ -923,8 +871,9 @@ mod tests {
 
     #[test]
     fn sampling_dropped_when_thinking_on() {
+        // `Toggle(true)` enables (adaptive) thinking, so temperature/top_p/top_k
+        // are suppressed (Anthropic rejects them together).
         let p = AnthropicProvider::new("k")
-            .with_model("claude-opus-4-8")
             .with_reasoning(ReasoningConfig::Toggle(true))
             .with_sampling(SamplingConfig {
                 temperature: Some(0.7),

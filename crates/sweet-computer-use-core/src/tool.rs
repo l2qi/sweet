@@ -218,8 +218,8 @@ fn schema() -> serde_json::Value {
                 "enum": ["left", "right", "middle"],
                 "description": "Mouse button for `click` (default left)."
             },
-            "dx": { "type": "number", "description": "Horizontal scroll in wheel lines." },
-            "dy": { "type": "number", "description": "Vertical scroll in wheel lines (positive scrolls up)." },
+            "dx": { "type": "number", "description": "Horizontal scroll in wheel lines (integer granularity; fractional rounds to the nearest line)." },
+            "dy": { "type": "number", "description": "Vertical scroll in wheel lines, positive scrolls up (integer granularity; fractional rounds to the nearest line)." },
             "from_x": { "type": "number" },
             "from_y": { "type": "number" },
             "to_x": { "type": "number" },

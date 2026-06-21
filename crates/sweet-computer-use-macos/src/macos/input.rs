@@ -110,14 +110,16 @@ pub fn move_cursor(x: f64, y: f64) {
 pub fn scroll(x: f64, y: f64, dx: f64, dy: f64) {
     // Scroll applies at the cursor, so place it first.
     unsafe { ffi::CGWarpMouseCursorPosition(CGPoint { x, y }) };
-    // wheel1 = vertical, wheel2 = horizontal (line units).
+    // wheel1 = vertical, wheel2 = horizontal (line units). Quartz takes integer
+    // line deltas, so round (rather than truncate) so a `dy` of 2.9 scrolls
+    // three lines, not two - and 0.5 is one line rather than a silent no-op.
     let ev = unsafe {
         ffi::CGEventCreateScrollWheelEvent(
             ptr::null(),
             ffi::kCGScrollEventUnitLine,
             2,
-            dy as i32,
-            dx as i32,
+            dy.round() as i32,
+            dx.round() as i32,
         )
     };
     post(ev);
@@ -154,22 +156,44 @@ pub fn drag(from_x: f64, from_y: f64, to_x: f64, to_y: f64) {
     );
 }
 
-/// Type a Unicode string as a single keyboard event pair.
+/// Type a Unicode string as a sequence of keyboard events.
 ///
-/// The string rides on the key-down event only; the key-up is a bare release.
-/// Setting the string on both can make some apps insert the text twice.
+/// `CGEventKeyboardSetUnicodeString` carries at most **20 UTF-16 code units**
+/// per event; anything longer is silently dropped. So a long string is chunked
+/// into <=20-unit segments (never splitting a surrogate pair) and each chunk is
+/// a key-down / key-up pair. The string rides on the key-down event only; the
+/// key-up is a bare release (setting it on both can make some apps insert the
+/// text twice).
 pub fn type_text(text: &str) {
-    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut chunk: Vec<u16> = Vec::with_capacity(20);
+    for c in text.chars() {
+        let units = c.len_utf16();
+        // Flush before adding a char that would overflow the 20-unit cap, so a
+        // 4-byte surrogate pair is never split across events.
+        if chunk.len() + units > UTF16_CHUNK_CAP {
+            post_string_chunk(&chunk);
+            chunk.clear();
+        }
+        c.encode_utf16(&mut chunk);
+    }
+    if !chunk.is_empty() {
+        post_string_chunk(&chunk);
+    }
+}
 
+/// `CGEventKeyboardSetUnicodeString`'s per-event UTF-16 code-unit cap.
+const UTF16_CHUNK_CAP: usize = 20;
+
+/// Emit one UTF-16 chunk as a key-down (carrying the string) / key-up pair.
+fn post_string_chunk(units: &[u16]) {
     let down = unsafe { ffi::CGEventCreateKeyboardEvent(ptr::null(), 0, true) };
     if !down.is_null() {
-        // Safety: `down` is valid; `utf16` outlives the call.
+        // Safety: `down` is valid; `units` outlives the call.
         unsafe {
-            ffi::CGEventKeyboardSetUnicodeString(down, utf16.len() as c_ulong, utf16.as_ptr());
+            ffi::CGEventKeyboardSetUnicodeString(down, units.len() as c_ulong, units.as_ptr());
         }
         post(down);
     }
-
     let up = unsafe { ffi::CGEventCreateKeyboardEvent(ptr::null(), 0, false) };
     post(up);
 }

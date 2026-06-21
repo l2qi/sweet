@@ -482,9 +482,7 @@ async fn complete_with_adaptive_thinking_sends_adaptive_field() {
 
     let provider = AnthropicProvider::new("k")
         .with_base_url(server.uri())
-        // Adaptive thinking requires a 4.6+ model; the toggle dialect maps to
-        // `{type: adaptive}` only there (older models get an explicit budget).
-        .with_model("claude-opus-4-8")
+        // `Toggle(true)` maps to adaptive thinking; no model name is sniffed.
         .with_reasoning(ReasoningConfig::Toggle(true));
 
     let reply = provider

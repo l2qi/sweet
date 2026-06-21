@@ -11,7 +11,6 @@ mod screenshot;
 mod windows;
 
 use std::path::Path;
-use std::time::Duration;
 
 use sweet_computer_use_core::{
     ActionOutcome, ComputerAction, ComputerObservation, ComputerUseError, ObserveOptions, Point,
@@ -176,19 +175,19 @@ pub fn act(action: &ComputerAction) -> Result<ActionOutcome, ComputerUseError> {
             accessibility::set_value(element, value)?;
             Ok(ActionOutcome::ok(format!("set value of element {element}")))
         }
-        ComputerAction::Wait { millis } => {
-            std::thread::sleep(Duration::from_millis(*millis));
-            Ok(ActionOutcome::ok(format!("waited {millis} ms")))
-        }
         ComputerAction::OpenApp { name } => {
             open_app(name)?;
             Ok(ActionOutcome::ok(format!("opened {name}")))
         }
-        ComputerAction::Observe { .. } | ComputerAction::Screenshot => {
-            Err(ComputerUseError::InvalidAction(
-                "observe/screenshot are handled by the observe path".to_string(),
-            ))
-        }
+        // `Wait` is resolved by the async provider (a non-blocking
+        // `tokio::time::sleep`) before it reaches this sync function;
+        // observe/screenshot are routed to `observe`. None are real platform
+        // actions, so reaching them here is a contract violation.
+        ComputerAction::Wait { .. }
+        | ComputerAction::Observe { .. }
+        | ComputerAction::Screenshot => Err(ComputerUseError::InvalidAction(
+            "wait/observe/screenshot are handled outside the platform act path".to_string(),
+        )),
     }
 }
 
@@ -205,6 +204,12 @@ fn requires_accessibility(action: &ComputerAction) -> bool {
 }
 
 /// Launch or focus an application by name via `/usr/bin/open`.
+///
+/// Deliberately bypasses `sweet-core`'s `CommandRunner`: this tool drives the
+/// host desktop GUI (a `Dangerous`, approval-gated action outside the project
+/// sandbox by nature), so the project's sandboxed shell policy does not apply.
+/// The path is a fixed system binary, not caller-controlled, so there is no
+/// injection surface.
 fn open_app(name: &str) -> Result<(), ComputerUseError> {
     let status = std::process::Command::new("/usr/bin/open")
         .arg("-a")

@@ -495,11 +495,20 @@ pub(crate) fn apply_prompt_caching(body: &mut Value) {
         set_cache_control_on_last(tools, &cc);
     }
 
-    // Messages: breakpoint on the last content block of the last message. The
-    // last message is always a user/tool message, whose blocks are cacheable
-    // (thinking blocks, which can't carry cache_control, never come last).
+    // Messages: breakpoint on the last content block of the last message, but
+    // only when that message is a user/tool message - its blocks are cacheable.
+    // An assistant reply can end in a `thinking` block, which Anthropic rejects
+    // `cache_control` on with a 400; guarding (rather than assuming the caller
+    // never ends on an assistant message) keeps the request valid.
     if let Some(Value::Array(messages)) = obj.get_mut("messages") {
         if let Some(Value::Object(last)) = messages.last_mut() {
+            let is_cacheable_role = matches!(
+                last.get("role"),
+                Some(Value::String(r)) if r == "user" || r == "tool"
+            );
+            if !is_cacheable_role {
+                return;
+            }
             match last.get_mut("content") {
                 Some(Value::String(text)) => {
                     let text = std::mem::take(text);
@@ -656,6 +665,25 @@ mod tests {
             body["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn apply_prompt_caching_skips_assistant_last_message() {
+        // An assistant reply ending the messages could land `cache_control` on
+        // a non-cacheable block (e.g. thinking), which Anthropic rejects with a
+        // 400. The breakpoint is skipped when the last message isn't user/tool.
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "hello" }
+                ] }
+            ]
+        });
+        apply_prompt_caching(&mut body);
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]

@@ -84,7 +84,8 @@ pub enum ComputerAction {
         y: f64,
     },
     /// Scroll at a point. `dy` is vertical (positive scrolls up), `dx` is
-    /// horizontal, both in wheel lines.
+    /// horizontal, both in **wheel lines**: integer granularity, rounded to the
+    /// nearest whole line (a fractional delta like `2.9` scrolls three lines).
     Scroll {
         #[serde(deserialize_with = "de_coord")]
         x: f64,

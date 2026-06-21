@@ -36,9 +36,11 @@ impl MacComputerUse {
     }
 }
 
-// The OS calls are synchronous, so the async methods perform their work inline
-// and resolve in a single poll. They hold no raw pointers across an await point
-// (there are none), so the provider stays `Send + Sync`.
+// The OS calls are synchronous, so `observe` and the platform actions resolve
+// in a single poll with no raw pointers held across an await point. `Wait` is
+// the one exception: it `tokio::time::sleep`s so it yields instead of blocking
+// the executor thread driving the provider. (`Send + Sync` still holds:
+// `tokio::time::Sleep` is `Send`.)
 #[async_trait]
 impl ComputerUseProvider for MacComputerUse {
     async fn observe(
@@ -49,6 +51,12 @@ impl ComputerUseProvider for MacComputerUse {
     }
 
     async fn act(&self, action: &ComputerAction) -> Result<ActionOutcome, ComputerUseError> {
+        // `Wait` is platform-neutral (just a pause) and must not block the
+        // executor, so resolve it here rather than in the sync platform path.
+        if let ComputerAction::Wait { millis } = action {
+            tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
+            return Ok(ActionOutcome::ok(format!("waited {millis} ms")));
+        }
         act_impl(action)
     }
 

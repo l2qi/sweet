@@ -84,8 +84,12 @@ impl CerebrasProvider {
     /// object Cerebras rejects.
     ///
     /// - [`ReasoningConfig::Effort`] -> `reasoning_effort`.
-    /// - `Toggle(false)` -> `reasoning_effort: "none"` (the documented way to
-    ///   *disable* reasoning on models that support it).
+    /// - `Toggle(false)` -> `reasoning_effort: "none"` - the documented way to
+    ///   *disable* reasoning. Note: the set of valid `reasoning_effort` values
+    ///   (including whether `"none"` is accepted) is **model-specific**
+    ///   (e.g. `zai-glm-4.7` takes only `none`; `gpt-oss-120b` takes
+    ///   `low`/`medium`/`high`). That knowledge belongs in the caller's model
+    ///   catalog, not here; this provider forwards what it is given.
     /// - `Toggle(true)` and [`ReasoningConfig::Budget`] are no-ops: Cerebras
     ///   reasons by default and has no token-budget knob.
     pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
