@@ -7,10 +7,15 @@ publish.workspace = true
 description = "LLM provider implementations for the sweet AI agent framework."
 
 [features]
-default = ["openai", "gemini", "anthropic"]
+default = ["openai", "gemini", "anthropic", "cerebras"]
 openai = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
 gemini = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
 anthropic = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:futures-util"]
+# OpenAI-wire-compatible providers that diverge on reasoning semantics. Each
+# composes `OpenAIProvider` (so it implies `openai`). Enabled by default but
+# distinct features, so `default-features = false, features = ["openai"]`
+# builds the OpenAI transport without pulling these in.
+cerebras = ["openai"]
 
 [dependencies]
 sweet-core = { path = "../sweet-core" }

@@ -11,6 +11,8 @@
 //!   `/v1beta/models/{model}:generateContent` protocol.
 //! - `anthropic` - [`AnthropicProvider`], speaks Anthropic's native
 //!   `/v1/messages` protocol.
+//! - `cerebras` - [`CerebrasProvider`], OpenAI-compatible transport with
+//!   Cerebras's own (effort-only) reasoning controls (implies `openai`).
 //!
 //! All features are enabled by default. Disable with
 //! `default-features = false` and opt back in to just what you need.
@@ -24,9 +26,9 @@ pub mod openai;
 
 /// Cerebras Inference provider - OpenAI-compatible transport with Cerebras's
 /// own (effort-only) reasoning controls.
-#[cfg(feature = "openai")]
+#[cfg(feature = "cerebras")]
 mod cerebras;
-#[cfg(feature = "openai")]
+#[cfg(feature = "cerebras")]
 pub use cerebras::CerebrasProvider;
 
 #[cfg(feature = "anthropic")]

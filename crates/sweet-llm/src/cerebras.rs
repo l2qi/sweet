@@ -77,6 +77,13 @@ impl CerebrasProvider {
         self
     }
 
+    /// Override the `User-Agent` header sent on every request (forwarded to
+    /// the inner transport).
+    pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.inner = self.inner.with_user_agent(ua);
+        self
+    }
+
     /// Set cross-provider sampling parameters (forwarded to the inner
     /// OpenAI-compatible transport).
     pub fn with_sampling(mut self, sampling: SamplingConfig) -> Self {
@@ -189,6 +196,12 @@ mod tests {
     fn context_window_delegates_to_inner() {
         let p = CerebrasProvider::new("k").with_context_window(131_072);
         assert_eq!(p.context_window(), Some(131_072));
+    }
+
+    #[test]
+    fn with_user_agent_overwrites_inner() {
+        let p = CerebrasProvider::new("k").with_user_agent("custom/1.0");
+        assert_eq!(p.inner.user_agent(), "custom/1.0");
     }
 
     #[test]

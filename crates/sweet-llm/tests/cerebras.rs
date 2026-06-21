@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Ryuichi Intellectual Property LLC and the Sweet project contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "openai")]
+#![cfg(feature = "cerebras")]
 
 //! Hermetic wiremock integration tests for [`CerebrasProvider`].
 //!

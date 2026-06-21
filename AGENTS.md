@@ -198,9 +198,10 @@ Feature flags:
 
 | Flag | Pulls in |
 |------|---------|
-| `openai` | `OpenAIProvider`, `OpenAIEmbedder`, `CerebrasProvider` |
+| `openai` | `OpenAIProvider`, `OpenAIEmbedder` |
 | `gemini` | `GeminiProvider`, `GeminiEmbedder` |
 | `anthropic` | `AnthropicProvider` |
+| `cerebras` | `CerebrasProvider` (implies `openai`) |
 | (default) | all of the above |
 
 ### sweet-tools
