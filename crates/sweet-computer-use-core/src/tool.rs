@@ -257,7 +257,7 @@ fn schema() -> serde_json::Value {
                 "description": "Accessibility element path (e.g. \"0/2/1\") for `ax_press`/`ax_set_value`."
             },
             "value": { "type": "string", "description": "New value for `ax_set_value`." },
-            "millis": { "type": "integer", "minimum": 0, "description": "Pause length for `wait`." },
+            "millis": { "type": "integer", "minimum": 0, "maximum": 60000, "description": "Pause length for `wait` in milliseconds (capped at 60s)." },
             "name": { "type": "string", "description": "Application name for `open_app`." },
             "include_screenshot": { "type": "boolean", "description": "Capture a screenshot during `observe` (default true)." }
         },

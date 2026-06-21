@@ -230,10 +230,19 @@ impl AnthropicProvider {
             // rewrites based on the model name.
             ReasoningConfig::Toggle(true) => WireThinking::Adaptive,
             // An explicit budget is emitted verbatim, clamped only to
-            // Anthropic's hard `1024 <= b < max_tokens` rule.
-            ReasoningConfig::Budget(_) => WireThinking::Enabled {
-                budget_tokens: self.thinking_budget(),
-            },
+            // Anthropic's hard `1024 <= b < max_tokens` rule. When the output
+            // cap is too small for a valid budget (`thinking_budget() == 0`),
+            // thinking is dropped rather than sending a request Anthropic would
+            // reject with a 400.
+            ReasoningConfig::Budget(_) => {
+                let budget = self.thinking_budget();
+                if budget == 0 {
+                    return None;
+                }
+                WireThinking::Enabled {
+                    budget_tokens: budget,
+                }
+            }
         })
     }
 
@@ -260,14 +269,24 @@ impl AnthropicProvider {
     /// *request* cap ([`request_max_tokens`](Self::request_max_tokens)), not the
     /// model ceiling, so a `sampling.max_tokens` override bounds the budget too
     /// (otherwise `budget_tokens` could exceed `max_tokens` and the API 400s).
-    /// Returns `0` unless reasoning is an explicit [`Budget`](ReasoningConfig::Budget).
+    /// Returns `0` unless reasoning is an explicit [`Budget`](ReasoningConfig::Budget);
+    /// also `0` when the output cap leaves no room for a budget >= the 1024
+    /// minimum (there is no valid `budget_tokens` in that case, so
+    /// [`wire_thinking`](Self::wire_thinking) drops thinking rather than send
+    /// an invalid request).
     fn thinking_budget(&self) -> usize {
         let requested = match self.reasoning.as_ref() {
             Some(ReasoningConfig::Budget(n)) => *n as usize,
             _ => return 0,
         };
         let upper = self.request_max_tokens().saturating_sub(1);
-        requested.clamp(MIN_THINKING_BUDGET.min(upper), upper)
+        // If the output cap leaves no room for a budget >= the 1024 minimum,
+        // there is no valid `budget_tokens` value: drop thinking (return 0)
+        // rather than send one Anthropic would reject with a 400.
+        if upper < MIN_THINKING_BUDGET {
+            return 0;
+        }
+        requested.clamp(MIN_THINKING_BUDGET, upper)
     }
 
     /// The output cap to send: an explicit sampling override, else the model
@@ -850,8 +869,10 @@ mod tests {
     #[test]
     fn budget_clamped_below_sampling_max_tokens_override() {
         // The budget is clamped against the *request* cap, not the model
-        // ceiling: a low `sampling.max_tokens` must bound the budget too, else
-        // Anthropic rejects `budget_tokens >= max_tokens` with a 400.
+        // ceiling. When that cap is too small for a budget >= the 1024 minimum
+        // (here `max_tokens` = 1000 leaves only `upper` = 999), there is no
+        // valid `budget_tokens`: thinking is dropped rather than sending one
+        // Anthropic would reject with a 400.
         let p = AnthropicProvider::new("k")
             .with_max_tokens(64_000)
             .with_sampling(SamplingConfig {
@@ -859,8 +880,8 @@ mod tests {
                 ..Default::default()
             })
             .with_reasoning(ReasoningConfig::Budget(8_000));
-        assert!(p.thinking_budget() < 1000);
-        assert_eq!(p.thinking_budget(), 999);
+        assert_eq!(p.thinking_budget(), 0);
+        assert!(p.wire_thinking().is_none());
     }
 
     #[test]

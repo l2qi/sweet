@@ -68,8 +68,12 @@ impl ComputerUseProvider for MacComputerUse {
         // `Wait` is platform-neutral (just a pause) and must not block the
         // executor, so resolve it here rather than in the sync platform path.
         if let ComputerAction::Wait { millis } = action {
-            tokio::time::sleep(std::time::Duration::from_millis(*millis)).await;
-            return Ok(ActionOutcome::ok(format!("waited {millis} ms")));
+            // Cap the pause so a model-requested wait can't hang the agent
+            // loop indefinitely.
+            const MAX_WAIT_MILLIS: u64 = 60_000;
+            let capped = (*millis).min(MAX_WAIT_MILLIS);
+            tokio::time::sleep(std::time::Duration::from_millis(capped)).await;
+            return Ok(ActionOutcome::ok(format!("waited {capped} ms")));
         }
         // `OpenApp` shells out via `open -a`, which is an async command-run -
         // handled here through the injected [`CommandRunner`] rather than the
