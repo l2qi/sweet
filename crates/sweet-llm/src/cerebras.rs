@@ -45,12 +45,13 @@ impl CerebrasProvider {
     /// endpoint (override with [`with_base_url`](Self::with_base_url)).
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            // Cerebras expects replayed assistant reasoning under `reasoning`,
-            // not the OpenAI-compatible `reasoning_content` (it renames the
-            // field server-side and rejects the wrong key in strict modes).
+            // Cerebras accepts no replayed reasoning property on request messages
+            // (neither `reasoning_content` nor `reasoning`); sending one is a
+            // 400 `wrong_api_format`. It does not retain reasoning across
+            // requests, so omit it entirely - the model re-reasons each turn.
             inner: OpenAIProvider::new(api_key)
                 .with_base_url(DEFAULT_BASE_URL)
-                .with_reasoning_history_key(ReasoningHistoryKey::Reasoning),
+                .with_reasoning_history_key(ReasoningHistoryKey::Omit),
         }
     }
 

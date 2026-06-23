@@ -52,13 +52,24 @@ pub struct OpenAIProvider {
     structured_output: Option<StructuredOutput>,
 }
 
-/// Which wire field carries replayed assistant reasoning history. Most
-/// OpenAI-compatible backends read `reasoning_content`; Cerebras expects
-/// `reasoning` (it renames the field server-side otherwise).
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ReasoningHistoryKey {
+/// Which wire field carries replayed assistant reasoning history on a request.
+///
+/// OpenAI-compatible backends disagree on whether prior reasoning may be
+/// replayed and under which field; the right choice is per-model and (for
+/// callers driven by the models.dev catalog) comes from its `interleaved` field:
+/// - [`ReasoningContent`](Self::ReasoningContent) - replay under `reasoning_content`
+///   (DeepSeek, Kimi, Qwen-on-some).
+/// - [`Reasoning`](Self::Reasoning) - replay under `reasoning`.
+/// - [`ReasoningDetails`](Self::ReasoningDetails) - replay OpenRouter's structured
+///   `reasoning_details` array verbatim.
+/// - [`Omit`](Self::Omit) - replay nothing (Cerebras, Qwen, and any model that
+///   rejects a replayed reasoning property). This is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningHistoryKey {
     ReasoningContent,
     Reasoning,
+    ReasoningDetails,
+    Omit,
 }
 
 /// Internal state for the OpenAI-compatible `thinking` object. Built via
@@ -87,7 +98,10 @@ impl OpenAIProvider {
             user_agent: format!("sweet/{}", SWEET_VERSION),
             reasoning_effort: None,
             thinking: None,
-            reasoning_history_key: ReasoningHistoryKey::ReasoningContent,
+            // Replay nothing by default - most OpenAI-compatible models reject a
+            // replayed reasoning property. Replay is opt-in per model via
+            // `with_reasoning_history_key` (catalog-driven in downstream crates).
+            reasoning_history_key: ReasoningHistoryKey::Omit,
             sampling: SamplingConfig::default(),
             tool_choice: None,
             structured_output: None,
@@ -150,9 +164,10 @@ impl OpenAIProvider {
         self
     }
 
-    /// Choose which wire field carries replayed assistant reasoning history.
-    /// Defaults to `reasoning_content`; Cerebras sets this to `reasoning`.
-    pub(crate) fn with_reasoning_history_key(mut self, key: ReasoningHistoryKey) -> Self {
+    /// Choose which wire field replays assistant reasoning history (see
+    /// [`ReasoningHistoryKey`]). Defaults to [`ReasoningHistoryKey::Omit`] - no
+    /// replay. Set this per model from the catalog's `interleaved` field.
+    pub fn with_reasoning_history_key(mut self, key: ReasoningHistoryKey) -> Self {
         self.reasoning_history_key = key;
         self
     }
@@ -259,6 +274,12 @@ impl OpenAIProvider {
         &self.model
     }
 
+    /// The wire field that replays assistant reasoning history (see
+    /// [`Self::with_reasoning_history_key`]).
+    pub fn reasoning_history_key(&self) -> ReasoningHistoryKey {
+        self.reasoning_history_key
+    }
+
     /// Build the per-request `thinking` config, or `None` when the user has
     /// not configured one.
     fn thinking_config(&self) -> Option<wire::ThinkingConfig> {
@@ -351,6 +372,7 @@ impl OpenAIProvider {
                     content: Some(WireContent::Parts(parts)),
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -689,6 +711,9 @@ impl OpenAIProvider {
         // explicit `reasoning_content: ""` from Kimi round-trips as a single
         // empty-text block (matches the non-streaming `TryFrom` path).
         let mut saw_reasoning_field = false;
+        // OpenRouter's structured reasoning blocks, accumulated verbatim across
+        // deltas for exact replay (takes precedence over the string view below).
+        let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
         let mut tool_call_accums: Vec<ToolCallAccum> = Vec::new();
         let mut total_tokens: Option<usize> = None;
         let mut prompt_tokens: Option<usize> = None;
@@ -719,6 +744,7 @@ impl OpenAIProvider {
                             .reasoning_content
                             .as_deref()
                             .or(choice.delta.reasoning.as_deref());
+                        let had_reasoning_string = reasoning_delta.is_some();
                         if let Some(rc) = reasoning_delta {
                             saw_reasoning_field = true;
                             if !rc.is_empty() {
@@ -727,6 +753,28 @@ impl OpenAIProvider {
                                     .await
                                     .map_err(provider_error_from_core)?;
                             }
+                        }
+                        if let Some(details) = choice.delta.reasoning_details {
+                            // The string reasoning (if present) already streamed
+                            // live above; only surface a `reasoning_details` block's
+                            // text when no string was sent this delta, so a provider
+                            // that emits both encodings doesn't double-render the
+                            // live chain-of-thought. The blocks are always kept for
+                            // verbatim replay.
+                            if !had_reasoning_string {
+                                for d in &details {
+                                    if let Some(t) = d
+                                        .get("text")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|t| !t.is_empty())
+                                    {
+                                        sink.on_thinking_delta(t)
+                                            .await
+                                            .map_err(provider_error_from_core)?;
+                                    }
+                                }
+                            }
+                            reasoning_details.extend(details);
                         }
                         if !choice.delta.content.is_empty() {
                             content.push_str(&choice.delta.content);
@@ -792,7 +840,14 @@ impl OpenAIProvider {
             compacted: false,
             finish_reason: None,
         };
-        if saw_reasoning_field {
+        // Precedence mirrors the non-streaming path: structured blocks
+        // (preserved verbatim) win over the single-string view.
+        if !reasoning_details.is_empty() {
+            reply.thinking_content = reasoning_details
+                .into_iter()
+                .map(wire::thinking_from_detail)
+                .collect();
+        } else if saw_reasoning_field {
             reply.set_reasoning_content(reasoning_content);
         }
         reply.finish_reason = finish_reason.as_deref().map(wire::map_finish_reason);

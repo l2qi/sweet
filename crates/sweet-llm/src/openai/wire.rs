@@ -6,7 +6,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sweet_core::{Message, Role, ToolCall};
+use sweet_core::{Message, Role, ThinkingContent, ToolCall};
 
 use sweet_core::FinishReason;
 
@@ -109,11 +109,15 @@ pub(crate) struct WireMessage<'a> {
     pub content: Option<WireContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<&'a str>,
-    /// Alternate reasoning-history field. Cerebras expects replayed assistant
-    /// reasoning under `reasoning` rather than `reasoning_content`; exactly one
-    /// of the two is ever populated (see [`super::ReasoningHistoryKey`]).
+    /// Alternate reasoning-history fields. At most one of `reasoning_content`,
+    /// `reasoning`, and `reasoning_details` is ever populated, selected per model
+    /// by [`super::ReasoningHistoryKey`]; `Omit` populates none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<&'a str>,
+    /// OpenRouter's structured reasoning array, replayed verbatim from each
+    /// preserved [`sweet_core::ThinkingContent::raw`] block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<&'a serde_json::Value>>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tool_calls: Vec<WireToolCall<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -166,8 +170,8 @@ impl<'a> WireMessage<'a> {
         )
     }
 
-    /// As [`WireMessage::new`], but selecting which wire field carries replayed
-    /// assistant reasoning (`reasoning_content` vs Cerebras's `reasoning`).
+    /// As [`WireMessage::new`], but selecting which wire field (if any) carries
+    /// replayed assistant reasoning (see [`super::ReasoningHistoryKey`]).
     pub(crate) fn new_with_key(
         m: &'a Message,
         include_reasoning: bool,
@@ -179,19 +183,30 @@ impl<'a> WireMessage<'a> {
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         };
+        // The single-string reasoning view, consumed only by the string-keyed
+        // arms below (`ReasoningContent` / `Reasoning`). `ReasoningDetails`
+        // builds from `thinking_content[].raw` instead, and `Omit` sends nothing.
         let reasoning_value = match m.reasoning_content() {
-            // Always echo reasoning back when the model provided it, even if the
-            // provider wasn't explicitly configured for thinking (DeepSeek/Kimi
-            // auto-enable it for thinking models).
+            // Echo reasoning back when the model provided it.
             Some(text) => Some(text),
             // When targeting a thinking-aware backend, ensure the field is
             // present on assistant messages even if empty.
             None if include_reasoning && role == "assistant" => Some(""),
             None => None,
         };
-        let (reasoning_content, reasoning) = match reasoning_key {
-            super::ReasoningHistoryKey::ReasoningContent => (reasoning_value, None),
-            super::ReasoningHistoryKey::Reasoning => (None, reasoning_value),
+        let (reasoning_content, reasoning, reasoning_details) = match reasoning_key {
+            super::ReasoningHistoryKey::ReasoningContent => (reasoning_value, None, None),
+            super::ReasoningHistoryKey::Reasoning => (None, reasoning_value, None),
+            super::ReasoningHistoryKey::ReasoningDetails => {
+                // Replay each preserved block verbatim (see `ThinkingContent::raw`).
+                let blocks: Vec<&serde_json::Value> = m
+                    .thinking_content
+                    .iter()
+                    .filter_map(|t| t.raw.as_ref())
+                    .collect();
+                (None, None, (!blocks.is_empty()).then_some(blocks))
+            }
+            super::ReasoningHistoryKey::Omit => (None, None, None),
         };
         Self {
             role,
@@ -248,6 +263,7 @@ impl<'a> WireMessage<'a> {
             },
             reasoning_content,
             reasoning,
+            reasoning_details,
             tool_calls: m
                 .tool_calls
                 .iter()
@@ -298,6 +314,9 @@ pub(crate) struct ResponseMessage {
     /// `gpt-oss`) emit `reasoning` instead of `reasoning_content`.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// OpenRouter's structured reasoning blocks, kept verbatim for replay.
+    #[serde(default)]
+    pub reasoning_details: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_calls: Vec<ResponseToolCall>,
 }
@@ -351,6 +370,9 @@ pub(crate) struct StreamDelta {
     /// Fallback reasoning field (see [`ResponseMessage::reasoning`]).
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// OpenRouter's structured reasoning blocks (see [`ResponseMessage::reasoning_details`]).
+    #[serde(default)]
+    pub reasoning_details: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_calls: Vec<StreamToolCallDelta>,
 }
@@ -366,6 +388,23 @@ pub(crate) struct StreamToolCallDelta {
 pub(crate) struct StreamToolCallFunctionDelta {
     pub name: Option<String>,
     pub arguments: Option<String>,
+}
+
+/// Convert one OpenRouter `reasoning_details[]` block into a [`ThinkingContent`]:
+/// the whole block is kept verbatim in `raw` (so it replays byte-for-byte), and
+/// its `text` field, if any, becomes the display/streaming view.
+pub(super) fn thinking_from_detail(block: Value) -> ThinkingContent {
+    let text = block
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    ThinkingContent {
+        text,
+        signature: None,
+        redacted_data: None,
+        raw: Some(block),
+    }
 }
 
 impl TryFrom<ResponseMessage> for Message {
@@ -408,7 +447,11 @@ impl TryFrom<ResponseMessage> for Message {
             compacted: false,
             finish_reason: None,
         };
-        if let Some(rc) = m.reasoning_content.or(m.reasoning) {
+        // Precedence: structured `reasoning_details` (preserved verbatim for
+        // exact replay) wins; otherwise the single-string view.
+        if let Some(details) = m.reasoning_details {
+            msg.thinking_content = details.into_iter().map(thinking_from_detail).collect();
+        } else if let Some(rc) = m.reasoning_content.or(m.reasoning) {
             msg.set_reasoning_content(rc);
         }
         Ok(msg)
@@ -474,6 +517,7 @@ mod tests {
             content: String::new(),
             reasoning_content: None,
             reasoning: None,
+            reasoning_details: None,
             tool_calls: Vec::new(),
         };
         let err = Message::try_from(m).unwrap_err();
@@ -637,23 +681,74 @@ mod tests {
 
     #[test]
     fn reasoning_history_key_selects_wire_field() {
+        use crate::openai::ReasoningHistoryKey as K;
         let mut msg = Message::assistant("hi");
         msg.set_reasoning_content("thinking");
+        let wire = |k| serde_json::to_value(WireMessage::new_with_key(&msg, true, k)).unwrap();
 
-        let default = WireMessage::new_with_key(
-            &msg,
-            true,
-            crate::openai::ReasoningHistoryKey::ReasoningContent,
-        );
-        let j = serde_json::to_value(&default).unwrap();
+        let j = wire(K::ReasoningContent);
         assert_eq!(j["reasoning_content"], "thinking");
         assert!(j.get("reasoning").is_none());
+        assert!(j.get("reasoning_details").is_none());
 
-        let cerebras =
-            WireMessage::new_with_key(&msg, true, crate::openai::ReasoningHistoryKey::Reasoning);
-        let j = serde_json::to_value(&cerebras).unwrap();
+        let j = wire(K::Reasoning);
         assert_eq!(j["reasoning"], "thinking");
         assert!(j.get("reasoning_content").is_none());
+
+        // Omit sends no reasoning field at all.
+        let j = wire(K::Omit);
+        assert!(j.get("reasoning_content").is_none());
+        assert!(j.get("reasoning").is_none());
+        assert!(j.get("reasoning_details").is_none());
+    }
+
+    #[test]
+    fn reasoning_details_key_replays_raw_blocks_verbatim() {
+        let block = serde_json::json!({"type": "reasoning.text", "text": "shown", "id": "r1"});
+        let mut msg = Message::assistant("hi");
+        msg.thinking_content = vec![ThinkingContent {
+            text: "shown".into(),
+            signature: None,
+            redacted_data: None,
+            raw: Some(block.clone()),
+        }];
+        let j = serde_json::to_value(WireMessage::new_with_key(
+            &msg,
+            true,
+            crate::openai::ReasoningHistoryKey::ReasoningDetails,
+        ))
+        .unwrap();
+        assert_eq!(j["reasoning_details"], serde_json::json!([block]));
+        assert!(j.get("reasoning_content").is_none());
+        assert!(j.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn response_reasoning_details_round_trip() {
+        // A response with structured reasoning blocks parses into thinking_content
+        // (text surfaced, block preserved in `raw`) and replays byte-identical.
+        let text_block = serde_json::json!({"type": "reasoning.text", "text": "because"});
+        let enc_block = serde_json::json!({"type": "reasoning.encrypted", "data": "OPAQUE"});
+        let raw = format!(
+            r#"{{"role":"assistant","content":"hi","reasoning_details":[{text_block},{enc_block}]}}"#
+        );
+        let m: ResponseMessage = serde_json::from_str(&raw).unwrap();
+        let msg = Message::try_from(m).unwrap();
+        assert_eq!(msg.thinking_content.len(), 2);
+        assert_eq!(msg.thinking_content[0].text, "because");
+        assert_eq!(msg.thinking_content[1].text, ""); // encrypted: no text
+        assert_eq!(msg.thinking_content[0].raw.as_ref(), Some(&text_block));
+
+        let j = serde_json::to_value(WireMessage::new_with_key(
+            &msg,
+            true,
+            crate::openai::ReasoningHistoryKey::ReasoningDetails,
+        ))
+        .unwrap();
+        assert_eq!(
+            j["reasoning_details"],
+            serde_json::json!([text_block, enc_block])
+        );
     }
 
     #[test]
