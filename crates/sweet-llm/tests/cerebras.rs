@@ -7,9 +7,10 @@
 //!
 //! These exercise the actual HTTP request/response cycle: they assert that the
 //! request body carries `reasoning_effort` (and never the `thinking` object
-//! Cerebras 400s on), and that replayed assistant reasoning history rides under
-//! the `reasoning` field rather than `reasoning_content`. The provider's
-//! internal state is covered by unit tests in `cerebras.rs`.
+//! Cerebras 400s on), and that prior assistant reasoning is omitted entirely -
+//! Cerebras accepts neither `reasoning_content` nor `reasoning` on a request and
+//! 400s `wrong_api_format` if either is sent. The provider's internal state is
+//! covered by unit tests in `cerebras.rs`.
 
 use sweet_core::{Message, Model};
 use sweet_llm::openai::ReasoningContent;
@@ -161,10 +162,11 @@ async fn no_reasoning_sends_no_reasoning_field() {
 }
 
 #[tokio::test]
-async fn reasoning_history_echoes_under_reasoning_not_reasoning_content() {
-    // Cerebras renames `reasoning_content` to `reasoning` server-side. When a
-    // prior assistant turn carries reasoning, the replay must use the `reasoning`
-    // field. This is the wire-level behavior the unit test can't see.
+async fn reasoning_history_is_omitted() {
+    // Cerebras accepts no replayed reasoning property on a request (it 400s
+    // `wrong_api_format` on either `reasoning_content` or `reasoning`). When a
+    // prior assistant turn carries reasoning, the replayed message must carry
+    // neither field. This is the wire-level behavior the unit test can't see.
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -202,9 +204,9 @@ async fn reasoning_history_echoes_under_reasoning_not_reasoning_content() {
         .iter()
         .find(|m| m["role"] == "assistant")
         .expect("assistant message in history");
-    assert_eq!(
-        assistant_msg["reasoning"], "hidden chain of thought",
-        "Cerebras must echo reasoning under the `reasoning` field"
+    assert!(
+        assistant_msg.get("reasoning").is_none(),
+        "Cerebras must not send `reasoning`; got {assistant_msg}"
     );
     assert!(
         assistant_msg.get("reasoning_content").is_none(),

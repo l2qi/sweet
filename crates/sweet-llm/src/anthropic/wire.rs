@@ -590,6 +590,7 @@ fn message_from_blocks(
                     text: thinking,
                     signature: Some(signature),
                     redacted_data: None,
+                    raw: None,
                 });
             }
             ContentBlock::RedactedThinking { data } => {
@@ -597,6 +598,7 @@ fn message_from_blocks(
                     text: String::new(),
                     signature: None,
                     redacted_data: Some(data),
+                    raw: None,
                 });
             }
             ContentBlock::Unknown => {}
@@ -704,6 +706,7 @@ mod tests {
             text: String::new(),
             signature: None,
             redacted_data: Some("ENC".to_string()),
+            raw: None,
         }];
         let (_system, wire) = convert_messages(std::slice::from_ref(&msg));
         let json = serde_json::to_value(&wire).unwrap();

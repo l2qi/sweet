@@ -36,7 +36,7 @@ pub use anthropic::AnthropicProvider;
 #[cfg(feature = "gemini")]
 pub use gemini::{GeminiEmbedder, GeminiProvider};
 #[cfg(feature = "openai")]
-pub use openai::{OpenAIEmbedder, OpenAIProvider};
+pub use openai::{OpenAIEmbedder, OpenAIProvider, ReasoningHistoryKey};
 
 #[cfg(any(feature = "openai", feature = "anthropic", feature = "gemini"))]
 mod reasoning;

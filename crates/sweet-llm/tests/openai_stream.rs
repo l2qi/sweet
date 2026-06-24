@@ -310,6 +310,102 @@ async fn complete_stream_preserves_explicit_empty_reasoning_content() {
 }
 
 #[tokio::test]
+async fn complete_stream_reassembles_fragmented_reasoning_details() {
+    // OpenRouter streams one logical reasoning block as fragments sharing an
+    // `index`: a metadata-only chunk first, then incremental `text`. They must
+    // reassemble into a single block (matching the non-streaming response) so it
+    // replays verbatim - list-concatenating the fragments would emit N partial
+    // entries and 400 on the next request. Text streams live as it arrives.
+    let server = MockServer::start().await;
+
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","format":"anthropic-claude-v1","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"Let me","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":" think","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"content":"42"}}]}"#,
+        r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
+        "[DONE]",
+    ]);
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new("k").with_base_url(server.uri());
+    let mut sink = CapturingSink::new();
+    let reply = provider
+        .complete_stream(&[Message::user("hi")], &[], &mut sink)
+        .await
+        .unwrap();
+
+    assert_eq!(reply.text_content(), "42");
+    // The three fragments at index 0 reassemble into ONE block.
+    assert_eq!(reply.thinking_content.len(), 1);
+    assert_eq!(reply.thinking_content[0].text, "Let me think");
+    assert_eq!(
+        reply.thinking_content[0].raw,
+        Some(serde_json::json!({
+            "type": "reasoning.text",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+            "text": "Let me think"
+        }))
+    );
+    // Each text fragment streamed live (no string field to cover it).
+    assert_eq!(sink.reasoning_deltas(), vec!["Let me", " think"]);
+}
+
+#[tokio::test]
+async fn complete_stream_does_not_double_emit_reasoning_when_both_forms_present() {
+    // OpenRouter streams the same reasoning as both a `reasoning` string and
+    // `reasoning_details`. The live channel must emit each fragment exactly once
+    // (from the string); the structured blocks are kept (reassembled by index)
+    // only for verbatim replay, not re-streamed.
+    let server = MockServer::start().await;
+
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"role":"assistant","reasoning":"Let me","reasoning_details":[{"type":"reasoning.text","text":"Let me","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning":" think","reasoning_details":[{"type":"reasoning.text","text":" think","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+        r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
+        "[DONE]",
+    ]);
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new("k").with_base_url(server.uri());
+    let mut sink = CapturingSink::new();
+    let reply = provider
+        .complete_stream(&[Message::user("hi")], &[], &mut sink)
+        .await
+        .unwrap();
+
+    assert_eq!(reply.text_content(), "ok");
+    // Each fragment streamed once (from the string), not doubled.
+    assert_eq!(sink.reasoning_deltas(), vec!["Let me", " think"]);
+    // Details reassembled into one verbatim block for replay.
+    assert_eq!(reply.thinking_content.len(), 1);
+    assert_eq!(reply.thinking_content[0].text, "Let me think");
+    assert!(reply.thinking_content[0].raw.is_some());
+}
+
+#[tokio::test]
 async fn complete_stream_omits_reasoning_when_field_never_present() {
     // When the server never sends `reasoning_content` at all, the streamed
     // Message has zero thinking blocks (distinct from "field present but

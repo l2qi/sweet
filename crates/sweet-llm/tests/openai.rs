@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use serial_test::serial;
 use sweet_core::{ContentBlock, Message, Model};
 use sweet_llm::openai::ReasoningContent;
-use sweet_llm::{openai, OpenAIProvider, ProviderError, ReasoningConfig};
+use sweet_llm::{openai, OpenAIProvider, ProviderError, ReasoningConfig, ReasoningHistoryKey};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -277,11 +277,11 @@ async fn complete_sends_thinking_budget_when_budget_configured() {
 }
 
 #[tokio::test]
-async fn complete_echoes_reasoning_content_when_present_even_without_thinking_config() {
+async fn complete_echoes_reasoning_content_when_key_is_reasoning_content() {
     let server = MockServer::start().await;
 
-    // reasoning_content is always echoed back when the model provided it,
-    // even if the provider wasn't explicitly configured for thinking.
+    // With the `ReasoningContent` history key, prior reasoning is echoed back
+    // when the model provided it, even without an explicit thinking config.
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(canned_response("ok")))
@@ -289,7 +289,9 @@ async fn complete_echoes_reasoning_content_when_present_even_without_thinking_co
         .mount(&server)
         .await;
 
-    let provider = OpenAIProvider::new("test-key").with_base_url(server.uri());
+    let provider = OpenAIProvider::new("test-key")
+        .with_base_url(server.uri())
+        .with_reasoning_history_key(ReasoningHistoryKey::ReasoningContent);
 
     let mut prior = Message::assistant("prev");
     prior.set_reasoning_content("hidden");
@@ -324,6 +326,7 @@ async fn complete_echoes_reasoning_content_on_messages_when_thinking_configured(
 
     let provider = OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
+        .with_reasoning_history_key(ReasoningHistoryKey::ReasoningContent)
         .with_reasoning(ReasoningConfig::Toggle(true));
 
     let mut prior = Message::assistant("prev");
@@ -358,6 +361,7 @@ async fn complete_echoes_empty_reasoning_content_for_assistant_when_thinking_con
 
     let provider = OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
+        .with_reasoning_history_key(ReasoningHistoryKey::ReasoningContent)
         .with_reasoning(ReasoningConfig::Toggle(true));
 
     let prior = Message::assistant("prev"); // no reasoning_content set
@@ -372,6 +376,38 @@ async fn complete_echoes_empty_reasoning_content_for_assistant_when_thinking_con
     assert!(
         body_str.contains("\"reasoning_content\":\"\""),
         "expected outgoing assistant message to carry empty reasoning_content, got: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn complete_omits_reasoning_by_default() {
+    // The default history key is `Omit`: a bare provider replays no reasoning
+    // field even when a prior assistant turn carries one (safe for backends that
+    // reject a replayed reasoning property, e.g. Cerebras/Qwen/DeepSeek).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(canned_response("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new("test-key").with_base_url(server.uri());
+
+    let mut prior = Message::assistant("prev");
+    prior.set_reasoning_content("hidden");
+
+    provider
+        .complete(&[Message::user("hi"), prior], &[])
+        .await
+        .expect("complete should succeed");
+
+    let received = server.received_requests().await.unwrap();
+    let body_str = std::str::from_utf8(&received[0].body).unwrap();
+    assert!(
+        !body_str.contains("reasoning_content") && !body_str.contains("\"reasoning\""),
+        "expected outgoing request to omit reasoning by default, got: {body_str}"
     );
 }
 

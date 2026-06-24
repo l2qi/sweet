@@ -52,13 +52,24 @@ pub struct OpenAIProvider {
     structured_output: Option<StructuredOutput>,
 }
 
-/// Which wire field carries replayed assistant reasoning history. Most
-/// OpenAI-compatible backends read `reasoning_content`; Cerebras expects
-/// `reasoning` (it renames the field server-side otherwise).
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ReasoningHistoryKey {
+/// Which wire field carries replayed assistant reasoning history on a request.
+///
+/// OpenAI-compatible backends disagree on whether prior reasoning may be
+/// replayed and under which field; the right choice is per-model and (for
+/// callers driven by the models.dev catalog) comes from its `interleaved` field:
+/// - [`ReasoningContent`](Self::ReasoningContent) - replay under `reasoning_content`
+///   (DeepSeek, Kimi, Qwen-on-some).
+/// - [`Reasoning`](Self::Reasoning) - replay under `reasoning`.
+/// - [`ReasoningDetails`](Self::ReasoningDetails) - replay OpenRouter's structured
+///   `reasoning_details` array verbatim.
+/// - [`Omit`](Self::Omit) - replay nothing (Cerebras, Qwen, and any model that
+///   rejects a replayed reasoning property). This is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningHistoryKey {
     ReasoningContent,
     Reasoning,
+    ReasoningDetails,
+    Omit,
 }
 
 /// Internal state for the OpenAI-compatible `thinking` object. Built via
@@ -87,7 +98,10 @@ impl OpenAIProvider {
             user_agent: format!("sweet/{}", SWEET_VERSION),
             reasoning_effort: None,
             thinking: None,
-            reasoning_history_key: ReasoningHistoryKey::ReasoningContent,
+            // Replay nothing by default - most OpenAI-compatible models reject a
+            // replayed reasoning property. Replay is opt-in per model via
+            // `with_reasoning_history_key` (catalog-driven in downstream crates).
+            reasoning_history_key: ReasoningHistoryKey::Omit,
             sampling: SamplingConfig::default(),
             tool_choice: None,
             structured_output: None,
@@ -150,9 +164,10 @@ impl OpenAIProvider {
         self
     }
 
-    /// Choose which wire field carries replayed assistant reasoning history.
-    /// Defaults to `reasoning_content`; Cerebras sets this to `reasoning`.
-    pub(crate) fn with_reasoning_history_key(mut self, key: ReasoningHistoryKey) -> Self {
+    /// Choose which wire field replays assistant reasoning history (see
+    /// [`ReasoningHistoryKey`]). Defaults to [`ReasoningHistoryKey::Omit`] - no
+    /// replay. Set this per model from the catalog's `interleaved` field.
+    pub fn with_reasoning_history_key(mut self, key: ReasoningHistoryKey) -> Self {
         self.reasoning_history_key = key;
         self
     }
@@ -259,6 +274,12 @@ impl OpenAIProvider {
         &self.model
     }
 
+    /// The wire field that replays assistant reasoning history (see
+    /// [`Self::with_reasoning_history_key`]).
+    pub fn reasoning_history_key(&self) -> ReasoningHistoryKey {
+        self.reasoning_history_key
+    }
+
     /// Build the per-request `thinking` config, or `None` when the user has
     /// not configured one.
     fn thinking_config(&self) -> Option<wire::ThinkingConfig> {
@@ -351,6 +372,7 @@ impl OpenAIProvider {
                     content: Some(WireContent::Parts(parts)),
                     reasoning_content: None,
                     reasoning: None,
+                    reasoning_details: None,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -689,6 +711,13 @@ impl OpenAIProvider {
         // explicit `reasoning_content: ""` from Kimi round-trips as a single
         // empty-text block (matches the non-streaming `TryFrom` path).
         let mut saw_reasoning_field = false;
+        // OpenRouter streams structured `reasoning_details` as fragments of one
+        // logical block (metadata first, then incremental text) keyed by `index`.
+        // Reassemble per index so the final blocks match the non-streaming
+        // response and replay verbatim - naive concatenation would emit N partial
+        // entries and 400 on the next request. Takes precedence over the string
+        // view below.
+        let mut reasoning_accums: Vec<ReasoningDetailAccum> = Vec::new();
         let mut tool_call_accums: Vec<ToolCallAccum> = Vec::new();
         let mut total_tokens: Option<usize> = None;
         let mut prompt_tokens: Option<usize> = None;
@@ -719,6 +748,10 @@ impl OpenAIProvider {
                             .reasoning_content
                             .as_deref()
                             .or(choice.delta.reasoning.as_deref());
+                        // Whether a non-empty reasoning string actually streamed
+                        // this delta (an explicit `reasoning: ""` does not count).
+                        let streamed_reasoning_text =
+                            reasoning_delta.is_some_and(|s| !s.is_empty());
                         if let Some(rc) = reasoning_delta {
                             saw_reasoning_field = true;
                             if !rc.is_empty() {
@@ -727,6 +760,34 @@ impl OpenAIProvider {
                                     .await
                                     .map_err(provider_error_from_core)?;
                             }
+                        }
+                        for block in choice.delta.reasoning_details.into_iter().flatten() {
+                            // Surface this fragment's text live, unless a reasoning
+                            // string already streamed it this delta (avoids
+                            // double-rendering when a provider sends both encodings).
+                            if !streamed_reasoning_text {
+                                if let Some(t) = block
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|t| !t.is_empty())
+                                {
+                                    sink.on_thinking_delta(t)
+                                        .await
+                                        .map_err(provider_error_from_core)?;
+                                }
+                            }
+                            // Merge into the entry for this block's `index` so a
+                            // fragmented block reassembles into one (verbatim replay).
+                            let idx = block
+                                .get("index")
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as usize)
+                                .unwrap_or(reasoning_accums.len());
+                            if reasoning_accums.len() <= idx {
+                                reasoning_accums
+                                    .resize_with(idx + 1, ReasoningDetailAccum::default);
+                            }
+                            reasoning_accums[idx].merge(block);
                         }
                         if !choice.delta.content.is_empty() {
                             content.push_str(&choice.delta.content);
@@ -792,7 +853,17 @@ impl OpenAIProvider {
             compacted: false,
             finish_reason: None,
         };
-        if saw_reasoning_field {
+        // Precedence mirrors the non-streaming path: structured blocks
+        // (reassembled, preserved verbatim) win over the single-string view.
+        // Skip empty slots left by any gap in the `index` sequence.
+        let reasoning_blocks: Vec<_> = reasoning_accums
+            .into_iter()
+            .filter(|a| !a.is_empty())
+            .map(|a| wire::thinking_from_detail(a.into_value()))
+            .collect();
+        if !reasoning_blocks.is_empty() {
+            reply.thinking_content = reasoning_blocks;
+        } else if saw_reasoning_field {
             reply.set_reasoning_content(reasoning_content);
         }
         reply.finish_reason = finish_reason.as_deref().map(wire::map_finish_reason);
@@ -839,6 +910,54 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+}
+
+/// Reassembles the streamed fragments of one OpenRouter `reasoning_details`
+/// block (grouped by `index`) into a single block, mirroring [`ToolCallAccum`].
+/// Content fields (`text`/`summary`/`data`) arrive incrementally and concatenate;
+/// identity fields (`type`/`index`/`format`/`id`/`signature`) are stable and keep
+/// their latest value.
+#[derive(Default)]
+struct ReasoningDetailAccum {
+    block: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ReasoningDetailAccum {
+    fn is_empty(&self) -> bool {
+        self.block.is_empty()
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        serde_json::Value::Object(self.block)
+    }
+
+    fn merge(&mut self, incoming: serde_json::Value) {
+        let map = match incoming {
+            serde_json::Value::Object(map) => map,
+            other => {
+                // A well-formed `reasoning_details` element is always an object;
+                // log and skip anything else rather than failing the stream.
+                tracing::debug!(
+                    target: "sweet_llm::observability",
+                    fragment = %other,
+                    "ignoring non-object reasoning_details fragment"
+                );
+                return;
+            }
+        };
+        for (k, v) in map {
+            let concat = matches!(k.as_str(), "text" | "summary" | "data")
+                && v.is_string()
+                && matches!(self.block.get(&k), Some(serde_json::Value::String(_)));
+            if concat {
+                if let Some(serde_json::Value::String(existing)) = self.block.get_mut(&k) {
+                    existing.push_str(v.as_str().unwrap_or_default());
+                }
+            } else {
+                self.block.insert(k, v);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

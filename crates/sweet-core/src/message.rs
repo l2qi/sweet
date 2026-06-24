@@ -60,7 +60,9 @@ pub struct ToolCall {
 /// than `Option`. `signature` is an opaque token used by Anthropic to verify
 /// thinking provenance on multi-turn requests; other providers leave it
 /// `None`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// Not `Eq`: `raw` holds an arbitrary `serde_json::Value`, which is `PartialEq`
+// but not `Eq` (JSON numbers can be floats).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ThinkingContent {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -70,6 +72,13 @@ pub struct ThinkingContent {
     /// `redacted_thinking` block rather than a `thinking` block.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub redacted_data: Option<String>,
+    /// Verbatim provider-native reasoning block, preserved when a wire format
+    /// must round-trip the original structure byte-for-byte rather than a plain
+    /// text view - e.g. one entry of OpenRouter's `reasoning_details` array.
+    /// `text` remains the display/streaming view; `raw`, when set, is what the
+    /// wire layer replays. Opaque and provider-agnostic.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub raw: Option<serde_json::Value>,
 }
 
 impl ThinkingContent {
@@ -78,6 +87,7 @@ impl ThinkingContent {
             text: text.into(),
             signature: None,
             redacted_data: None,
+            raw: None,
         }
     }
 }
@@ -180,7 +190,9 @@ mod serde_base64 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+// Not `Eq`: `thinking_content` carries `ThinkingContent`, which is `PartialEq`
+// only (its `raw` field holds a `serde_json::Value`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     /// Content blocks. Most messages contain a single `ContentBlock::Text`.

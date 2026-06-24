@@ -60,7 +60,9 @@ impl std::str::FromStr for SessionId {
 }
 
 /// A single item stored in a session.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+// Not `Eq`: wraps `Message`, which is `PartialEq` only (its thinking blocks may
+// carry an arbitrary `serde_json::Value`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum MemoryItem {
     Message(Message),
 }
