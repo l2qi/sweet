@@ -310,16 +310,17 @@ async fn complete_stream_preserves_explicit_empty_reasoning_content() {
 }
 
 #[tokio::test]
-async fn complete_stream_accumulates_reasoning_details_and_streams_text() {
-    // A structured-only provider: reasoning arrives as `reasoning_details`
-    // blocks with no parallel `reasoning` string. Each block is preserved
-    // verbatim in `thinking_content[].raw` for replay, and its text streams
-    // live via on_thinking_delta (so streaming stays consistent with the
-    // string-based providers).
+async fn complete_stream_reassembles_fragmented_reasoning_details() {
+    // OpenRouter streams one logical reasoning block as fragments sharing an
+    // `index`: a metadata-only chunk first, then incremental `text`. They must
+    // reassemble into a single block (matching the non-streaming response) so it
+    // replays verbatim - list-concatenating the fragments would emit N partial
+    // entries and 400 on the next request. Text streams live as it arrives.
     let server = MockServer::start().await;
 
     let body = sse_body(&[
-        r#"{"choices":[{"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"Let me","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","format":"anthropic-claude-v1","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"Let me","index":0}]}}]}"#,
         r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":" think","index":0}]}}]}"#,
         r#"{"choices":[{"delta":{"content":"42"}}]}"#,
         r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
@@ -345,14 +346,19 @@ async fn complete_stream_accumulates_reasoning_details_and_streams_text() {
         .unwrap();
 
     assert_eq!(reply.text_content(), "42");
-    // Both blocks accumulated, each kept verbatim in `raw` with its text view.
-    assert_eq!(reply.thinking_content.len(), 2);
-    assert_eq!(reply.thinking_content[0].text, "Let me");
+    // The three fragments at index 0 reassemble into ONE block.
+    assert_eq!(reply.thinking_content.len(), 1);
+    assert_eq!(reply.thinking_content[0].text, "Let me think");
     assert_eq!(
         reply.thinking_content[0].raw,
-        Some(serde_json::json!({"type": "reasoning.text", "text": "Let me", "index": 0}))
+        Some(serde_json::json!({
+            "type": "reasoning.text",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+            "text": "Let me think"
+        }))
     );
-    // Details-only: text streamed live (no string field to cover it).
+    // Each text fragment streamed live (no string field to cover it).
     assert_eq!(sink.reasoning_deltas(), vec!["Let me", " think"]);
 }
 
@@ -360,13 +366,13 @@ async fn complete_stream_accumulates_reasoning_details_and_streams_text() {
 async fn complete_stream_does_not_double_emit_reasoning_when_both_forms_present() {
     // OpenRouter streams the same reasoning as both a `reasoning` string and
     // `reasoning_details`. The live channel must emit each fragment exactly once
-    // (from the string); the structured blocks are kept only for verbatim
-    // replay, not re-streamed.
+    // (from the string); the structured blocks are kept (reassembled by index)
+    // only for verbatim replay, not re-streamed.
     let server = MockServer::start().await;
 
     let body = sse_body(&[
-        r#"{"choices":[{"delta":{"role":"assistant","reasoning":"Let me","reasoning_details":[{"type":"reasoning.text","text":"Let me"}]}}]}"#,
-        r#"{"choices":[{"delta":{"reasoning":" think","reasoning_details":[{"type":"reasoning.text","text":" think"}]}}]}"#,
+        r#"{"choices":[{"delta":{"role":"assistant","reasoning":"Let me","reasoning_details":[{"type":"reasoning.text","text":"Let me","index":0}]}}]}"#,
+        r#"{"choices":[{"delta":{"reasoning":" think","reasoning_details":[{"type":"reasoning.text","text":" think","index":0}]}}]}"#,
         r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
         r#"{"choices":[{"finish_reason":"stop","delta":{}}]}"#,
         "[DONE]",
@@ -393,8 +399,9 @@ async fn complete_stream_does_not_double_emit_reasoning_when_both_forms_present(
     assert_eq!(reply.text_content(), "ok");
     // Each fragment streamed once (from the string), not doubled.
     assert_eq!(sink.reasoning_deltas(), vec!["Let me", " think"]);
-    // Final message uses the structured form (verbatim) for replay.
-    assert_eq!(reply.thinking_content.len(), 2);
+    // Details reassembled into one verbatim block for replay.
+    assert_eq!(reply.thinking_content.len(), 1);
+    assert_eq!(reply.thinking_content[0].text, "Let me think");
     assert!(reply.thinking_content[0].raw.is_some());
 }
 

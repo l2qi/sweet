@@ -711,9 +711,13 @@ impl OpenAIProvider {
         // explicit `reasoning_content: ""` from Kimi round-trips as a single
         // empty-text block (matches the non-streaming `TryFrom` path).
         let mut saw_reasoning_field = false;
-        // OpenRouter's structured reasoning blocks, accumulated verbatim across
-        // deltas for exact replay (takes precedence over the string view below).
-        let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
+        // OpenRouter streams structured `reasoning_details` as fragments of one
+        // logical block (metadata first, then incremental text) keyed by `index`.
+        // Reassemble per index so the final blocks match the non-streaming
+        // response and replay verbatim - naive concatenation would emit N partial
+        // entries and 400 on the next request. Takes precedence over the string
+        // view below.
+        let mut reasoning_accums: Vec<ReasoningDetailAccum> = Vec::new();
         let mut tool_call_accums: Vec<ToolCallAccum> = Vec::new();
         let mut total_tokens: Option<usize> = None;
         let mut prompt_tokens: Option<usize> = None;
@@ -744,7 +748,10 @@ impl OpenAIProvider {
                             .reasoning_content
                             .as_deref()
                             .or(choice.delta.reasoning.as_deref());
-                        let had_reasoning_string = reasoning_delta.is_some();
+                        // Whether a non-empty reasoning string actually streamed
+                        // this delta (an explicit `reasoning: ""` does not count).
+                        let streamed_reasoning_text =
+                            reasoning_delta.is_some_and(|s| !s.is_empty());
                         if let Some(rc) = reasoning_delta {
                             saw_reasoning_field = true;
                             if !rc.is_empty() {
@@ -754,27 +761,33 @@ impl OpenAIProvider {
                                     .map_err(provider_error_from_core)?;
                             }
                         }
-                        if let Some(details) = choice.delta.reasoning_details {
-                            // The string reasoning (if present) already streamed
-                            // live above; only surface a `reasoning_details` block's
-                            // text when no string was sent this delta, so a provider
-                            // that emits both encodings doesn't double-render the
-                            // live chain-of-thought. The blocks are always kept for
-                            // verbatim replay.
-                            if !had_reasoning_string {
-                                for d in &details {
-                                    if let Some(t) = d
-                                        .get("text")
-                                        .and_then(|v| v.as_str())
-                                        .filter(|t| !t.is_empty())
-                                    {
-                                        sink.on_thinking_delta(t)
-                                            .await
-                                            .map_err(provider_error_from_core)?;
-                                    }
+                        for block in choice.delta.reasoning_details.into_iter().flatten() {
+                            // Surface this fragment's text live, unless a reasoning
+                            // string already streamed it this delta (avoids
+                            // double-rendering when a provider sends both encodings).
+                            if !streamed_reasoning_text {
+                                if let Some(t) = block
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|t| !t.is_empty())
+                                {
+                                    sink.on_thinking_delta(t)
+                                        .await
+                                        .map_err(provider_error_from_core)?;
                                 }
                             }
-                            reasoning_details.extend(details);
+                            // Merge into the entry for this block's `index` so a
+                            // fragmented block reassembles into one (verbatim replay).
+                            let idx = block
+                                .get("index")
+                                .and_then(|v| v.as_u64())
+                                .map(|n| n as usize)
+                                .unwrap_or(reasoning_accums.len());
+                            if reasoning_accums.len() <= idx {
+                                reasoning_accums
+                                    .resize_with(idx + 1, ReasoningDetailAccum::default);
+                            }
+                            reasoning_accums[idx].merge(block);
                         }
                         if !choice.delta.content.is_empty() {
                             content.push_str(&choice.delta.content);
@@ -841,12 +854,15 @@ impl OpenAIProvider {
             finish_reason: None,
         };
         // Precedence mirrors the non-streaming path: structured blocks
-        // (preserved verbatim) win over the single-string view.
-        if !reasoning_details.is_empty() {
-            reply.thinking_content = reasoning_details
-                .into_iter()
-                .map(wire::thinking_from_detail)
-                .collect();
+        // (reassembled, preserved verbatim) win over the single-string view.
+        // Skip empty slots left by any gap in the `index` sequence.
+        let reasoning_blocks: Vec<_> = reasoning_accums
+            .into_iter()
+            .filter(|a| !a.is_empty())
+            .map(|a| wire::thinking_from_detail(a.into_value()))
+            .collect();
+        if !reasoning_blocks.is_empty() {
+            reply.thinking_content = reasoning_blocks;
         } else if saw_reasoning_field {
             reply.set_reasoning_content(reasoning_content);
         }
@@ -894,6 +910,54 @@ struct ToolCallAccum {
     id: String,
     name: String,
     arguments: String,
+}
+
+/// Reassembles the streamed fragments of one OpenRouter `reasoning_details`
+/// block (grouped by `index`) into a single block, mirroring [`ToolCallAccum`].
+/// Content fields (`text`/`summary`/`data`) arrive incrementally and concatenate;
+/// identity fields (`type`/`index`/`format`/`id`/`signature`) are stable and keep
+/// their latest value.
+#[derive(Default)]
+struct ReasoningDetailAccum {
+    block: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ReasoningDetailAccum {
+    fn is_empty(&self) -> bool {
+        self.block.is_empty()
+    }
+
+    fn into_value(self) -> serde_json::Value {
+        serde_json::Value::Object(self.block)
+    }
+
+    fn merge(&mut self, incoming: serde_json::Value) {
+        let map = match incoming {
+            serde_json::Value::Object(map) => map,
+            other => {
+                // A well-formed `reasoning_details` element is always an object;
+                // log and skip anything else rather than failing the stream.
+                tracing::debug!(
+                    target: "sweet_llm::observability",
+                    fragment = %other,
+                    "ignoring non-object reasoning_details fragment"
+                );
+                return;
+            }
+        };
+        for (k, v) in map {
+            let concat = matches!(k.as_str(), "text" | "summary" | "data")
+                && v.is_string()
+                && matches!(self.block.get(&k), Some(serde_json::Value::String(_)));
+            if concat {
+                if let Some(serde_json::Value::String(existing)) = self.block.get_mut(&k) {
+                    existing.push_str(v.as_str().unwrap_or_default());
+                }
+            } else {
+                self.block.insert(k, v);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
