@@ -14,6 +14,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::message::ToolCall;
+
 /// How risky a tool invocation is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +72,24 @@ pub enum ApprovalDecision {
     AllowSession,
     /// Reject the tool call.
     Deny,
+    /// Defer the decision: do not execute now. In an interruptible turn
+    /// (`Agent::step_stream_interruptible`) this pauses the turn so a durable
+    /// runtime can park the run, persist the pending calls, and resume later via
+    /// `Agent::resume_with_approvals` — without re-invoking the model. In a
+    /// non-interruptible turn there is nowhere to park, so `Defer` is treated as
+    /// `Deny`.
+    Defer,
+}
+
+/// A tool call awaiting an approval decision, surfaced when an interruptible
+/// turn pauses. Carries enough to render an approval prompt and, after the
+/// decision arrives, resume execution of exactly these calls.
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    /// The tool call awaiting approval.
+    pub tool_call: ToolCall,
+    /// Its risk classification.
+    pub risk: ToolRisk,
 }
 
 /// Pure decision function: does this (mode, risk) combination require

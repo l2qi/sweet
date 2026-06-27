@@ -11,7 +11,9 @@ use tracing::Instrument;
 
 use sweet_core::message::{ContentBlock, Message, Role, ToolCall};
 use sweet_core::model::Model;
-use sweet_core::permission::{ApprovalDecision, PermissionMode, PermissionState, ToolRisk};
+use sweet_core::permission::{
+    ApprovalDecision, PendingApproval, PermissionMode, PermissionState, ToolRisk,
+};
 use sweet_core::session::{InMemorySession, MemoryItem, Session};
 use sweet_core::tool::{ToolError, ToolOutput, ToolSpec};
 use sweet_core::Result;
@@ -53,10 +55,30 @@ impl IntoContentBlocks for &String {
 use crate::commands::CommandContext;
 use crate::dynamic_prompt::DynamicPrompt;
 use crate::extension::{Activation, Capability, CapabilityProvider, ExtensionRegistry, PromptSpec};
-use crate::handoff::{HandoffSpec, TurnResult};
+use crate::handoff::{HandoffSpec, TurnOutcome, TurnResult};
 use crate::hooks::{HookDispatcher, HookEvent};
 use crate::runloop::{AgentIo, IoStreamSink};
 use crate::subagent::{SubagentSpec, PARENT_MODEL};
+
+/// Outcome of the permission gate for a single tool call.
+enum Gate {
+    /// Execute the call.
+    Proceed,
+    /// Reject the call with this error (becomes a tool-result message).
+    Deny(ToolError),
+    /// Defer the decision (pause an interruptible turn).
+    Defer,
+}
+
+/// Outcome of dispatching one sequential batch of tool calls.
+enum SeqOutcome {
+    /// Every call resolved (or was denied) and its result pushed.
+    Done,
+    /// A handoff was requested; interrupt the turn.
+    Handoff(String, String),
+    /// A call deferred for approval; pause the turn with these pending calls.
+    Paused(Vec<PendingApproval>),
+}
 
 /// A minimal conversational agent backed by a [`Model`].
 ///
@@ -438,10 +460,30 @@ impl<M: Model> Agent<M> {
             }),
         )
         .await?;
+        // The plain `step` API never pauses: with `allow_pause = false` a
+        // deferred approval is treated as a denial.
+        let outcome = self.run_model_loop(turn_index, io, false).await?;
+        let TurnOutcome::Turn(result) = outcome else {
+            unreachable!("run_model_loop cannot pause when allow_pause is false");
+        };
+        self.finalize_turn(turn_index, history_len_before, &result)
+            .await?;
+        Ok(result)
+    }
+
+    /// The model-call ⇄ tool-dispatch loop shared by [`Agent::step`],
+    /// [`Agent::step_stream_interruptible`], and [`Agent::resume_with_approvals`].
+    /// When `allow_pause` is set, a deferred approval returns
+    /// [`TurnOutcome::Paused`] instead of denying the call.
+    async fn run_model_loop(
+        &mut self,
+        turn_index: usize,
+        io: &mut (impl AgentIo + ?Sized),
+        allow_pause: bool,
+    ) -> Result<TurnOutcome> {
         let tools = self.all_tools();
         let mut model_call_index = 0usize;
-        let mut early_handoff: Option<TurnResult> = None;
-        'outer: loop {
+        loop {
             model_call_index += 1;
             self.fire_hook(
                 HookEvent::BeforeModelCall,
@@ -515,7 +557,11 @@ impl<M: Model> Agent<M> {
             let has_calls = !reply.tool_calls.is_empty();
             self.session.push(MemoryItem::Message(reply))?;
             if !has_calls {
-                break;
+                let message = match self.session.items().last() {
+                    Some(MemoryItem::Message(m)) => m.clone(),
+                    _ => panic!("session lost the assistant message we just pushed"),
+                };
+                return Ok(TurnOutcome::Turn(TurnResult::Message(message)));
             }
             let calls = match self.session.items().last() {
                 Some(MemoryItem::Message(m)) => m.tool_calls.clone(),
@@ -525,59 +571,95 @@ impl<M: Model> Agent<M> {
                 if let Some((target, payload)) =
                     self.dispatch_concurrent(&calls, turn_index, io).await?
                 {
-                    early_handoff = Some(TurnResult::Handoff {
+                    return Ok(TurnOutcome::Turn(TurnResult::Handoff {
                         target,
                         payload: Some(payload),
-                    });
-                    break 'outer;
+                    }));
                 }
             } else {
-                for call in calls {
-                    self.fire_hook(HookEvent::BeforeToolCall, json_value(&call))
-                        .await?;
-
-                    // --- Permission gate ---
-                    let result = match self.check_permission(&call, io).await {
-                        Some(denied) => denied,
-                        None => self.dispatch(&call, turn_index).await,
-                    };
-
-                    let handoff = match &result {
-                        Err(ToolError::Handoff { target, payload }) => {
-                            Some((target.clone(), payload.clone()))
-                        }
-                        _ => None,
-                    };
-                    let (display, message) = tool_result_to_message(&call.id, &result);
-                    self.fire_hook(
-                        HookEvent::AfterToolCall,
-                        serde_json::json!({
-                            "call": json_value(&call),
-                            "result": display.clone(),
-                        }),
-                    )
-                    .await?;
-                    io.on_tool_result(&call, &display).await?;
-                    self.session.push(MemoryItem::Message(message))?;
-                    if let Some((target, payload)) = handoff {
-                        early_handoff = Some(TurnResult::Handoff {
+                match self
+                    .dispatch_sequential(&calls, turn_index, io, allow_pause)
+                    .await?
+                {
+                    SeqOutcome::Done => {}
+                    SeqOutcome::Handoff(target, payload) => {
+                        return Ok(TurnOutcome::Turn(TurnResult::Handoff {
                             target,
                             payload: Some(payload),
-                        });
-                        break 'outer;
+                        }));
                     }
+                    SeqOutcome::Paused(pending) => return Ok(TurnOutcome::Paused { pending }),
                 }
             }
         }
-        let result = match early_handoff {
-            Some(handoff) => handoff,
-            None => TurnResult::Message(match self.session.items().last() {
-                Some(MemoryItem::Message(m)) => m.clone(),
-                _ => panic!(
-                    "session lost the assistant message - step_stream loop pushed at least one"
-                ),
-            }),
-        };
+    }
+
+    /// Dispatch one sequential batch of tool calls (writes/dangerous). Returns
+    /// early on a handoff or, when `allow_pause`, on a deferred approval.
+    async fn dispatch_sequential(
+        &mut self,
+        calls: &[ToolCall],
+        turn_index: usize,
+        io: &mut (impl AgentIo + ?Sized),
+        allow_pause: bool,
+    ) -> Result<SeqOutcome> {
+        for idx in 0..calls.len() {
+            let call = &calls[idx];
+            self.fire_hook(HookEvent::BeforeToolCall, json_value(call))
+                .await?;
+
+            let result = match self.gate(call, io).await {
+                Gate::Proceed => self.dispatch(call, turn_index).await,
+                Gate::Deny(err) => Err(err),
+                Gate::Defer => {
+                    if allow_pause {
+                        let pending = calls[idx..]
+                            .iter()
+                            .map(|c| PendingApproval {
+                                tool_call: c.clone(),
+                                risk: self.risk_of(c).unwrap_or(ToolRisk::Dangerous),
+                            })
+                            .collect();
+                        return Ok(SeqOutcome::Paused(pending));
+                    }
+                    Err(ToolError::PermissionDenied(format!(
+                        "User denied tool call: {}",
+                        call.name
+                    )))
+                }
+            };
+
+            let handoff = match &result {
+                Err(ToolError::Handoff { target, payload }) => {
+                    Some((target.clone(), payload.clone()))
+                }
+                _ => None,
+            };
+            let (display, message) = tool_result_to_message(&call.id, &result);
+            self.fire_hook(
+                HookEvent::AfterToolCall,
+                serde_json::json!({
+                    "call": json_value(call),
+                    "result": display.clone(),
+                }),
+            )
+            .await?;
+            io.on_tool_result(call, &display).await?;
+            self.session.push(MemoryItem::Message(message))?;
+            if let Some((target, payload)) = handoff {
+                return Ok(SeqOutcome::Handoff(target, payload));
+            }
+        }
+        Ok(SeqOutcome::Done)
+    }
+
+    /// Emit the turn-finished span and fire the `AfterTurn` hook.
+    async fn finalize_turn(
+        &mut self,
+        turn_index: usize,
+        history_len_before: usize,
+        result: &TurnResult,
+    ) -> Result<()> {
         tracing::debug!(
             target: "sweet_agent::observability",
             event = "agent.turn.finished",
@@ -587,7 +669,7 @@ impl<M: Model> Agent<M> {
             transcript = %json_string(&self.build_messages()),
             "agent turn finished"
         );
-        let after_payload = match &result {
+        let after_payload = match result {
             TurnResult::Message(m) => serde_json::json!({
                 "turn_index": turn_index,
                 "kind": "message",
@@ -602,7 +684,141 @@ impl<M: Model> Agent<M> {
             }),
         };
         self.fire_hook(HookEvent::AfterTurn, after_payload).await?;
-        Ok(result)
+        Ok(())
+    }
+
+    /// Drive one turn that may **pause** for tool approval.
+    ///
+    /// Like [`Agent::step_stream`], but if the `io`'s approval callback returns
+    /// [`ApprovalDecision::Defer`] the turn stops at that call and returns
+    /// [`TurnOutcome::Paused`] with the not-yet-executed calls. The assistant
+    /// message (with its `tool_calls`) is already persisted to the session, so a
+    /// durable runtime can park the run and later call
+    /// [`Agent::resume_with_approvals`] to finish it **without re-invoking the
+    /// model**.
+    pub async fn step_stream_interruptible(
+        &mut self,
+        user_input: impl IntoContentBlocks,
+        io: &mut (impl AgentIo + ?Sized),
+    ) -> Result<TurnOutcome> {
+        let user_blocks = user_input.into_content_blocks();
+        let turn_index = self
+            .session
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count()
+            + 1;
+        let history_len_before = self.session.items().len();
+        self.repair_orphaned_tool_calls()?;
+        self.session
+            .push(MemoryItem::Message(Message::user_blocks(user_blocks)))?;
+        self.fire_hook(
+            HookEvent::BeforeTurn,
+            serde_json::json!({
+                "turn_index": turn_index,
+                "history_len_before": history_len_before,
+            }),
+        )
+        .await?;
+        let parent_model = self.shareable_model.clone();
+        let outcome = PARENT_MODEL
+            .scope(parent_model, self.run_model_loop(turn_index, io, true))
+            .await?;
+        if let TurnOutcome::Turn(ref result) = outcome {
+            self.finalize_turn(turn_index, history_len_before, result)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Resume a turn that paused via [`Agent::step_stream_interruptible`].
+    ///
+    /// Executes the trailing assistant message's not-yet-resolved tool calls —
+    /// the `io`'s approval callback now supplies the human's decision for each —
+    /// then continues the model loop. No new user message is appended and the
+    /// model is **not** re-invoked for the already-produced assistant turn. May
+    /// pause again (returning [`TurnOutcome::Paused`]) if a call is deferred.
+    pub async fn resume_with_approvals(
+        &mut self,
+        io: &mut (impl AgentIo + ?Sized),
+    ) -> Result<TurnOutcome> {
+        let turn_index = self
+            .session
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count();
+        let history_len_before = self.session.items().len();
+        let parent_model = self.shareable_model.clone();
+        let outcome = PARENT_MODEL
+            .scope(parent_model, self.resume_loop(turn_index, io))
+            .await?;
+        if let TurnOutcome::Turn(ref result) = outcome {
+            self.finalize_turn(turn_index, history_len_before, result)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Whether the trailing assistant turn has tool calls still awaiting
+    /// execution — i.e. a turn that paused for approval. A durable runtime uses
+    /// this on a rehydrated agent to decide between starting a new turn
+    /// ([`Agent::step_stream_interruptible`]) and finishing the paused one
+    /// ([`Agent::resume_with_approvals`]).
+    pub fn has_pending_approvals(&self) -> bool {
+        !self.unresolved_trailing_tool_calls().is_empty()
+    }
+
+    async fn resume_loop(
+        &mut self,
+        turn_index: usize,
+        io: &mut (impl AgentIo + ?Sized),
+    ) -> Result<TurnOutcome> {
+        let pending = self.unresolved_trailing_tool_calls();
+        match self
+            .dispatch_sequential(&pending, turn_index, io, true)
+            .await?
+        {
+            SeqOutcome::Paused(pending) => return Ok(TurnOutcome::Paused { pending }),
+            SeqOutcome::Handoff(target, payload) => {
+                return Ok(TurnOutcome::Turn(TurnResult::Handoff {
+                    target,
+                    payload: Some(payload),
+                }));
+            }
+            SeqOutcome::Done => {}
+        }
+        self.run_model_loop(turn_index, io, true).await
+    }
+
+    /// The trailing assistant message's `tool_calls` that have no matching
+    /// tool-result yet (i.e. those left unexecuted when the turn paused).
+    fn unresolved_trailing_tool_calls(&self) -> Vec<ToolCall> {
+        let items = self.session.items();
+        let Some(assistant_idx) = items.iter().rposition(|item| {
+            let MemoryItem::Message(msg) = item;
+            msg.role == Role::Assistant
+        }) else {
+            return Vec::new();
+        };
+        let MemoryItem::Message(assistant) = &items[assistant_idx];
+        if assistant.tool_calls.is_empty() {
+            return Vec::new();
+        }
+        let mut resolved: HashSet<&str> = HashSet::new();
+        for item in &items[assistant_idx + 1..] {
+            let MemoryItem::Message(m) = item;
+            if let Some(ref id) = m.tool_call_id {
+                resolved.insert(id.as_str());
+            }
+        }
+        assistant
+            .tool_calls
+            .iter()
+            .filter(|tc| !resolved.contains(tc.id.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// All tools visible to the model, including regular tools and handoffs.
@@ -806,51 +1022,51 @@ impl<M: Model> Agent<M> {
         result
     }
 
-    /// Check whether a tool call needs user approval. Returns `Some(Err)` if
-    /// the call was denied, or `None` if dispatch should proceed normally.
-    async fn check_permission(
-        &self,
-        call: &ToolCall,
-        io: &mut (impl AgentIo + ?Sized),
-    ) -> Option<std::result::Result<ToolOutput, ToolError>> {
-        let risk = match self.tools.iter().find(|t| t.name == call.name) {
-            Some(tool) => tool.risk,
-            None => {
-                // Handoff tools are always read-only. An unknown name is left
-                // for `dispatch` to reject - no point gating a call that
-                // cannot run.
-                if self.handoffs.iter().any(|h| h.name == call.name) {
-                    ToolRisk::ReadOnly
-                } else {
-                    return None;
-                }
-            }
+    /// The risk level the permission system assigns to a call: the tool's risk,
+    /// `ReadOnly` for handoff tools, or `None` for an unknown name (which
+    /// `dispatch` will reject — no point gating a call that cannot run).
+    fn risk_of(&self, call: &ToolCall) -> Option<ToolRisk> {
+        if let Some(tool) = self.tools.iter().find(|t| t.name == call.name) {
+            return Some(tool.risk);
+        }
+        if self.handoffs.iter().any(|h| h.name == call.name) {
+            return Some(ToolRisk::ReadOnly);
+        }
+        None
+    }
+
+    /// Run the permission gate for a single call: decide whether to proceed,
+    /// deny, or defer (pause) it.
+    async fn gate(&self, call: &ToolCall, io: &mut (impl AgentIo + ?Sized)) -> Gate {
+        let Some(risk) = self.risk_of(call) else {
+            return Gate::Proceed;
         };
 
         if !sweet_core::permission::needs_approval(self.permission.mode(), risk) {
-            return None;
+            return Gate::Proceed;
         }
 
         // Session approvals are keyed by (tool, scope) - the same scope shown
         // in the prompt - so "Always" grants exactly what the user saw.
         let scope = sweet_core::permission::approval_scope(&call.arguments);
         if self.permission.is_allowed(&call.name, &scope) {
-            return None;
+            return Gate::Proceed;
         }
 
         match io.on_tool_approval(call, risk).await {
-            Ok(ApprovalDecision::Allow) => None,
+            Ok(ApprovalDecision::Allow) => Gate::Proceed,
             Ok(ApprovalDecision::AllowSession) => {
                 self.permission.allow(call.name.clone(), scope);
-                None
+                Gate::Proceed
             }
-            Ok(ApprovalDecision::Deny) => Some(Err(ToolError::PermissionDenied(format!(
+            Ok(ApprovalDecision::Deny) => Gate::Deny(ToolError::PermissionDenied(format!(
                 "User denied tool call: {}",
                 call.name
-            )))),
-            Err(e) => Some(Err(ToolError::PermissionDenied(format!(
+            ))),
+            Ok(ApprovalDecision::Defer) => Gate::Defer,
+            Err(e) => Gate::Deny(ToolError::PermissionDenied(format!(
                 "Approval check failed: {e}"
-            )))),
+            ))),
         }
     }
 }

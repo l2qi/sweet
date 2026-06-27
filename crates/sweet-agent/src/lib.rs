@@ -32,7 +32,9 @@ pub use extension::{
     Activation, Capability, CapabilityProvider, Extension, ExtensionRegistry, PromptSpec,
     ToolCapabilities,
 };
-pub use handoff::{HandoffContext, HandoffHandler, HandoffResult, HandoffSpec, TurnResult};
+pub use handoff::{
+    HandoffContext, HandoffHandler, HandoffResult, HandoffSpec, TurnOutcome, TurnResult,
+};
 pub use hooks::{
     HookCapability, HookDispatcher, HookEvent, HookInvocation, ProcedureHandler, ProcedureSpec,
 };
