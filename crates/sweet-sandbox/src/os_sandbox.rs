@@ -51,6 +51,17 @@ impl OsSandbox {
         let canonical_root =
             dunce::canonicalize(&project_root).unwrap_or_else(|_| project_root.clone());
 
+        // Canonicalize the extra read roots once, at the boundary, exactly as we
+        // do for `project_root`. The OS command runners match on the resolved
+        // path (Seatbelt lists both `/tmp` and `/private/tmp` for this reason),
+        // so a symlinked or relative root passed raw would be readable by the
+        // in-process file tools (which canonicalize internally) yet denied to
+        // sandboxed commands. Canonicalizing here keeps both layers in agreement.
+        let extra_read_roots: Vec<PathBuf> = extra_read_roots
+            .into_iter()
+            .map(|r| dunce::canonicalize(&r).unwrap_or(r))
+            .collect();
+
         let fs: Arc<dyn Filesystem> = Arc::new(RestrictedFs::with_local_fs_and_reads(
             canonical_root.clone(),
             extra_read_roots.clone(),
