@@ -388,13 +388,7 @@ impl<M: Model> Agent<M> {
         io: &mut (impl AgentIo + ?Sized),
     ) -> Result<TurnResult> {
         let user_blocks = user_input.into_content_blocks();
-        let turn_index = self
-            .session
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .count()
-            + 1;
+        let turn_index = self.next_turn_index(true);
         let history_len_before = self.session.items().len();
         let span = tracing::debug_span!(
             target: "sweet_agent::observability",
@@ -429,6 +423,19 @@ impl<M: Model> Agent<M> {
         self.finalize_turn(turn_index, history_len_before, &result)
             .await?;
         Ok(result)
+    }
+
+    /// Index of the turn being driven: the count of user messages so far, plus
+    /// one when a new user message is about to be appended (`step`/interruptible
+    /// start), plus zero when resuming a paused turn whose user message is
+    /// already in the transcript.
+    fn next_turn_index(&self, add_user: bool) -> usize {
+        self.session
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count()
+            + usize::from(add_user)
     }
 
     /// Shared turn preamble for the plain and interruptible paths: repair any
@@ -540,19 +547,16 @@ impl<M: Model> Agent<M> {
                     }
                 }
             };
-            let has_calls = !reply.tool_calls.is_empty();
-            self.session.push(MemoryItem::Message(reply))?;
-            if !has_calls {
-                let message = match self.session.items().last() {
-                    Some(MemoryItem::Message(m)) => m.clone(),
-                    _ => panic!("session lost the assistant message we just pushed"),
-                };
+            // Capture what the loop needs from the reply before it is moved
+            // into the session, so we never read it back (and never have to
+            // reason about a "message vanished after push" impossible state).
+            if reply.tool_calls.is_empty() {
+                let message = reply.clone();
+                self.session.push(MemoryItem::Message(reply))?;
                 return Ok(TurnOutcome::Turn(TurnResult::Message(message)));
             }
-            let calls = match self.session.items().last() {
-                Some(MemoryItem::Message(m)) => m.tool_calls.clone(),
-                _ => panic!("session lost the assistant message we just pushed"),
-            };
+            let calls = reply.tool_calls.clone();
+            self.session.push(MemoryItem::Message(reply))?;
             if self.all_read_only(&calls) {
                 if let Some((target, payload)) =
                     self.dispatch_concurrent(&calls, turn_index, io).await?
@@ -696,13 +700,7 @@ impl<M: Model> Agent<M> {
         io: &mut (impl AgentIo + ?Sized),
     ) -> Result<TurnOutcome> {
         let user_blocks = user_input.into_content_blocks();
-        let turn_index = self
-            .session
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .count()
-            + 1;
+        let turn_index = self.next_turn_index(true);
         let history_len_before = self.session.items().len();
         let span = tracing::debug_span!(
             target: "sweet_agent::observability",
@@ -760,12 +758,7 @@ impl<M: Model> Agent<M> {
                 "resume_with_approvals called with no pending tool approvals",
             ));
         }
-        let turn_index = self
-            .session
-            .messages()
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .count();
+        let turn_index = self.next_turn_index(false);
         let history_len_before = self.session.items().len();
         let span = tracing::debug_span!(
             target: "sweet_agent::observability",
