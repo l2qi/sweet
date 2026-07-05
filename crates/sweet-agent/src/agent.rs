@@ -624,7 +624,7 @@ impl<M: Model> Agent<M> {
                 let pending = calls[idx..]
                     .iter()
                     .filter_map(|c| {
-                        self.approval_risk(c).map(|risk| PendingApproval {
+                        self.approval_risk(c).map(|(risk, _scope)| PendingApproval {
                             tool_call: c.clone(),
                             risk,
                         })
@@ -1066,13 +1066,15 @@ impl<M: Model> Agent<M> {
         None
     }
 
-    /// The risk at which `call` would prompt the user for approval, or `None`
-    /// if it would proceed without one — an unknown tool, a risk the current
-    /// mode auto-approves, or a call already granted for this session's
-    /// (tool, scope). Shared by [`Agent::gate`] and the paused-turn
-    /// `PendingApproval` list so both agree on what "needs approval" means, and
-    /// neither invents a risk for a call that never prompts.
-    fn approval_risk(&self, call: &ToolCall) -> Option<ToolRisk> {
+    /// The risk and approval scope at which `call` would prompt the user, or
+    /// `None` if it would proceed without a prompt — an unknown tool, a risk
+    /// the current mode auto-approves, or a call already granted for this
+    /// session's (tool, scope). [`Agent::gate`] reuses the returned scope to
+    /// record an "Always" grant; the paused-turn `PendingApproval` list uses
+    /// only the risk. Sharing this keeps both in agreement on what "needs
+    /// approval" means, and stops either inventing a risk for a call that never
+    /// prompts.
+    fn approval_risk(&self, call: &ToolCall) -> Option<(ToolRisk, String)> {
         let risk = self.risk_of(call)?;
         if !sweet_core::permission::needs_approval(self.permission.mode(), risk) {
             return None;
@@ -1083,20 +1085,19 @@ impl<M: Model> Agent<M> {
         if self.permission.is_allowed(&call.name, &scope) {
             return None;
         }
-        Some(risk)
+        Some((risk, scope))
     }
 
     /// Run the permission gate for a single call: decide whether to proceed,
     /// deny, or defer (pause) it.
     async fn gate(&self, call: &ToolCall, io: &mut (impl AgentIo + ?Sized)) -> Gate {
-        let Some(risk) = self.approval_risk(call) else {
+        let Some((risk, scope)) = self.approval_risk(call) else {
             return Gate::Proceed;
         };
 
         match io.on_tool_approval(call, risk).await {
             Ok(ApprovalDecision::Allow) => Gate::Proceed,
             Ok(ApprovalDecision::AllowSession) => {
-                let scope = sweet_core::permission::approval_scope(&call.arguments);
                 self.permission.allow(call.name.clone(), scope);
                 Gate::Proceed
             }
