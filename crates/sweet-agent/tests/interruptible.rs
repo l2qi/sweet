@@ -10,7 +10,8 @@ use std::collections::VecDeque;
 use sweet_agent::test_util::{MockModel, MockTool, VecIo};
 use sweet_agent::{Agent, TurnOutcome, TurnResult};
 use sweet_core::message::{Role, ToolCall};
-use sweet_core::permission::ApprovalDecision;
+use sweet_core::permission::{ApprovalDecision, ToolRisk};
+use sweet_core::tool::ToolSpec;
 
 fn tool_call(id: &str) -> ToolCall {
     ToolCall {
@@ -222,6 +223,57 @@ async fn has_pending_approvals_tracks_pause_and_completion() {
     assert!(matches!(outcome, TurnOutcome::Turn(TurnResult::Message(_))));
     // Completed: the trailing assistant message has no unresolved calls.
     assert!(!agent.has_pending_approvals());
+}
+
+#[tokio::test]
+async fn paused_pending_lists_only_approval_requiring_suffix_calls() {
+    // One assistant turn requests a dangerous call followed by a read-only one.
+    // The dangerous call defers, pausing the turn. Only the deferred call needs
+    // approval — the read-only follower proceeds without a prompt on resume — so
+    // the pause must surface just the dangerous call (with its real risk), not
+    // the whole unexecuted suffix.
+    let model = MockModel::with_scripted([
+        MockModel::reply_tool_calls(vec![
+            ToolCall {
+                id: "danger_1".into(),
+                name: "danger".into(),
+                arguments: serde_json::json!({ "msg": "x" }),
+            },
+            ToolCall {
+                id: "look_1".into(),
+                name: "look".into(),
+                arguments: serde_json::json!({ "msg": "y" }),
+            },
+        ]),
+        MockModel::reply_text("done"),
+    ]);
+    let mut agent = Agent::new(model)
+        // `danger` keeps the default `Dangerous` risk; `look` is read-only.
+        .with_tool(MockTool::echoing("danger"))
+        .with_tool(ToolSpec::from(MockTool::echoing("look")).with_risk(ToolRisk::ReadOnly));
+
+    let mut io = VecIo::with_inputs(Vec::<&str>::new());
+    io.approval_decision = ApprovalDecision::Defer;
+
+    let outcome = agent
+        .step_stream_interruptible("go", &mut io)
+        .await
+        .unwrap();
+    let pending = match outcome {
+        TurnOutcome::Paused { pending } => pending,
+        other => panic!("expected pause, got {other:?}"),
+    };
+    assert_eq!(
+        pending.len(),
+        1,
+        "only the approval-requiring call should be pending"
+    );
+    assert_eq!(pending[0].tool_call.id, "danger_1");
+    assert_eq!(pending[0].risk, ToolRisk::Dangerous);
+    assert!(
+        !pending.iter().any(|p| p.tool_call.id == "look_1"),
+        "the read-only follower must not be surfaced for approval"
+    );
 }
 
 #[tokio::test]

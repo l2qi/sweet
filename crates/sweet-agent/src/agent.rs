@@ -390,19 +390,9 @@ impl<M: Model> Agent<M> {
         let user_blocks = user_input.into_content_blocks();
         let turn_index = self.next_turn_index(true);
         let history_len_before = self.session.items().len();
-        let span = tracing::debug_span!(
-            target: "sweet_agent::observability",
-            "agent.turn",
-            turn_index,
-            history_len_before
-        );
-        // Shadow PARENT_MODEL for the duration of this turn so subagent tools
-        // dispatched from inside `step_loop` see this agent as their parent.
         let parent_model = self.shareable_model.clone();
-        let fut = self
-            .step_loop(user_blocks, turn_index, history_len_before, io)
-            .instrument(span);
-        PARENT_MODEL.scope(parent_model, fut).await
+        let fut = self.step_loop(user_blocks, turn_index, history_len_before, io);
+        Self::scope_turn(parent_model, turn_index, history_len_before, false, fut).await
     }
 
     async fn step_loop(
@@ -423,6 +413,29 @@ impl<M: Model> Agent<M> {
         self.finalize_turn(turn_index, history_len_before, &result)
             .await?;
         Ok(result)
+    }
+
+    /// Run `fut` — an inner turn body — inside this turn's tracing span with
+    /// `PARENT_MODEL` shadowed, so subagent tools dispatched from within see
+    /// this agent as their parent. `parent_model` is cloned from `self` at the
+    /// call site *before* the body borrows `self` mutably, so this is an
+    /// associated fn rather than a method. `resume` distinguishes a resumed
+    /// turn's span from a fresh one.
+    async fn scope_turn<T>(
+        parent_model: Option<Arc<dyn Model>>,
+        turn_index: usize,
+        history_len_before: usize,
+        resume: bool,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let span = tracing::debug_span!(
+            target: "sweet_agent::observability",
+            "agent.turn",
+            turn_index,
+            history_len_before,
+            resume,
+        );
+        PARENT_MODEL.scope(parent_model, fut.instrument(span)).await
     }
 
     /// Index of the turn being driven: the count of user messages so far, plus
@@ -603,11 +616,18 @@ impl<M: Model> Agent<M> {
             // pause first and let the resumed pass emit a clean `Before`/`After`.
             let gate = self.gate(call, io).await;
             if allow_pause && matches!(gate, Gate::Defer) {
+                // Surface only the suffix calls that actually need approval,
+                // each with its true risk. A read-only or unknown call queued
+                // after the deferred one proceeds (or is rejected) on resume
+                // without a prompt, so it does not belong in the approval list —
+                // and would otherwise carry a fabricated `Dangerous` risk.
                 let pending = calls[idx..]
                     .iter()
-                    .map(|c| PendingApproval {
-                        tool_call: c.clone(),
-                        risk: self.risk_of(c).unwrap_or(ToolRisk::Dangerous),
+                    .filter_map(|c| {
+                        self.approval_risk(c).map(|risk| PendingApproval {
+                            tool_call: c.clone(),
+                            risk,
+                        })
                     })
                     .collect();
                 return Ok(SeqOutcome::Paused(pending));
@@ -689,7 +709,7 @@ impl<M: Model> Agent<M> {
     ///
     /// Like [`Agent::step_stream`], but if the `io`'s approval callback returns
     /// [`ApprovalDecision::Defer`] the turn stops at that call and returns
-    /// [`TurnOutcome::Paused`] with the not-yet-executed calls. The assistant
+    /// [`TurnOutcome::Paused`] with the approval-requiring calls. The assistant
     /// message (with its `tool_calls`) is already persisted to the session, so a
     /// durable runtime can park the run and later call
     /// [`Agent::resume_with_approvals`] to finish it **without re-invoking the
@@ -702,20 +722,9 @@ impl<M: Model> Agent<M> {
         let user_blocks = user_input.into_content_blocks();
         let turn_index = self.next_turn_index(true);
         let history_len_before = self.session.items().len();
-        let span = tracing::debug_span!(
-            target: "sweet_agent::observability",
-            "agent.turn",
-            turn_index,
-            history_len_before
-        );
-        // Shadow PARENT_MODEL for the whole turn so subagent tools dispatched
-        // from inside the loop see this agent as their parent (matches
-        // `step_stream`).
         let parent_model = self.shareable_model.clone();
-        let fut = self
-            .interruptible_turn(user_blocks, turn_index, history_len_before, io)
-            .instrument(span);
-        PARENT_MODEL.scope(parent_model, fut).await
+        let fut = self.interruptible_turn(user_blocks, turn_index, history_len_before, io);
+        Self::scope_turn(parent_model, turn_index, history_len_before, false, fut).await
     }
 
     async fn interruptible_turn(
@@ -760,18 +769,9 @@ impl<M: Model> Agent<M> {
         }
         let turn_index = self.next_turn_index(false);
         let history_len_before = self.session.items().len();
-        let span = tracing::debug_span!(
-            target: "sweet_agent::observability",
-            "agent.turn",
-            turn_index,
-            history_len_before,
-            resume = true
-        );
         let parent_model = self.shareable_model.clone();
-        let fut = self
-            .resume_turn(turn_index, history_len_before, io)
-            .instrument(span);
-        PARENT_MODEL.scope(parent_model, fut).await
+        let fut = self.resume_turn(turn_index, history_len_before, io);
+        Self::scope_turn(parent_model, turn_index, history_len_before, true, fut).await
     }
 
     async fn resume_turn(
@@ -1066,27 +1066,37 @@ impl<M: Model> Agent<M> {
         None
     }
 
-    /// Run the permission gate for a single call: decide whether to proceed,
-    /// deny, or defer (pause) it.
-    async fn gate(&self, call: &ToolCall, io: &mut (impl AgentIo + ?Sized)) -> Gate {
-        let Some(risk) = self.risk_of(call) else {
-            return Gate::Proceed;
-        };
-
+    /// The risk at which `call` would prompt the user for approval, or `None`
+    /// if it would proceed without one — an unknown tool, a risk the current
+    /// mode auto-approves, or a call already granted for this session's
+    /// (tool, scope). Shared by [`Agent::gate`] and the paused-turn
+    /// `PendingApproval` list so both agree on what "needs approval" means, and
+    /// neither invents a risk for a call that never prompts.
+    fn approval_risk(&self, call: &ToolCall) -> Option<ToolRisk> {
+        let risk = self.risk_of(call)?;
         if !sweet_core::permission::needs_approval(self.permission.mode(), risk) {
-            return Gate::Proceed;
+            return None;
         }
-
         // Session approvals are keyed by (tool, scope) - the same scope shown
         // in the prompt - so "Always" grants exactly what the user saw.
         let scope = sweet_core::permission::approval_scope(&call.arguments);
         if self.permission.is_allowed(&call.name, &scope) {
-            return Gate::Proceed;
+            return None;
         }
+        Some(risk)
+    }
+
+    /// Run the permission gate for a single call: decide whether to proceed,
+    /// deny, or defer (pause) it.
+    async fn gate(&self, call: &ToolCall, io: &mut (impl AgentIo + ?Sized)) -> Gate {
+        let Some(risk) = self.approval_risk(call) else {
+            return Gate::Proceed;
+        };
 
         match io.on_tool_approval(call, risk).await {
             Ok(ApprovalDecision::Allow) => Gate::Proceed,
             Ok(ApprovalDecision::AllowSession) => {
+                let scope = sweet_core::permission::approval_scope(&call.arguments);
                 self.permission.allow(call.name.clone(), scope);
                 Gate::Proceed
             }
