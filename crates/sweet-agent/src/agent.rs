@@ -418,6 +418,28 @@ impl<M: Model> Agent<M> {
         history_len_before: usize,
         io: &mut (impl AgentIo + ?Sized),
     ) -> Result<TurnResult> {
+        self.begin_turn(user_input, turn_index, history_len_before)
+            .await?;
+        // The plain `step` API never pauses: with `allow_pause = false` a
+        // deferred approval is treated as a denial.
+        let outcome = self.run_model_loop(turn_index, io, false).await?;
+        let TurnOutcome::Turn(result) = outcome else {
+            unreachable!("run_model_loop cannot pause when allow_pause is false");
+        };
+        self.finalize_turn(turn_index, history_len_before, &result)
+            .await?;
+        Ok(result)
+    }
+
+    /// Shared turn preamble for the plain and interruptible paths: repair any
+    /// tool calls orphaned by a previous interruption, append the user message,
+    /// and fire `BeforeTurn`.
+    async fn begin_turn(
+        &mut self,
+        user_input: Vec<ContentBlock>,
+        turn_index: usize,
+        history_len_before: usize,
+    ) -> Result<()> {
         // Repair before appending the user message: synthetic tool results
         // are pushed to the end of the session, so they must land directly
         // after the orphaned assistant message, not after the new user turn.
@@ -432,15 +454,7 @@ impl<M: Model> Agent<M> {
             }),
         )
         .await?;
-        // The plain `step` API never pauses: with `allow_pause = false` a
-        // deferred approval is treated as a denial.
-        let outcome = self.run_model_loop(turn_index, io, false).await?;
-        let TurnOutcome::Turn(result) = outcome else {
-            unreachable!("run_model_loop cannot pause when allow_pause is false");
-        };
-        self.finalize_turn(turn_index, history_len_before, &result)
-            .await?;
-        Ok(result)
+        Ok(())
     }
 
     /// The model-call ⇄ tool-dispatch loop shared by [`Agent::step`],
@@ -713,17 +727,8 @@ impl<M: Model> Agent<M> {
         history_len_before: usize,
         io: &mut (impl AgentIo + ?Sized),
     ) -> Result<TurnOutcome> {
-        self.repair_orphaned_tool_calls()?;
-        self.session
-            .push(MemoryItem::Message(Message::user_blocks(user_blocks)))?;
-        self.fire_hook(
-            HookEvent::BeforeTurn,
-            serde_json::json!({
-                "turn_index": turn_index,
-                "history_len_before": history_len_before,
-            }),
-        )
-        .await?;
+        self.begin_turn(user_blocks, turn_index, history_len_before)
+            .await?;
         let outcome = self.run_model_loop(turn_index, io, true).await?;
         if let TurnOutcome::Turn(ref result) = outcome {
             self.finalize_turn(turn_index, history_len_before, result)
@@ -739,10 +744,22 @@ impl<M: Model> Agent<M> {
     /// then continues the model loop. No new user message is appended and the
     /// model is **not** re-invoked for the already-produced assistant turn. May
     /// pause again (returning [`TurnOutcome::Paused`]) if a call is deferred.
+    ///
+    /// Returns [`sweet_core::Error::Unsupported`] if there are no pending
+    /// approvals to resume — callers gate on [`Agent::has_pending_approvals`].
     pub async fn resume_with_approvals(
         &mut self,
         io: &mut (impl AgentIo + ?Sized),
     ) -> Result<TurnOutcome> {
+        // Misuse guard: with nothing pending, resume would fall through to
+        // `run_model_loop` and re-invoke the model on a transcript ending in a
+        // completed assistant turn (no new user/tool message) — a confusing
+        // provider error at best. Fail loudly instead of silently re-prompting.
+        if !self.has_pending_approvals() {
+            return Err(sweet_core::Error::Unsupported(
+                "resume_with_approvals called with no pending tool approvals",
+            ));
+        }
         let turn_index = self
             .session
             .messages()

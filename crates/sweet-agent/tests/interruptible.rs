@@ -223,3 +223,26 @@ async fn has_pending_approvals_tracks_pause_and_completion() {
     // Completed: the trailing assistant message has no unresolved calls.
     assert!(!agent.has_pending_approvals());
 }
+
+#[tokio::test]
+async fn resume_without_pending_approvals_errors_instead_of_re_invoking_model() {
+    // Misuse guard: resuming a turn that has nothing awaiting approval must not
+    // silently re-invoke the model on a completed transcript. It fails loudly
+    // and leaves the model untouched.
+    let model = MockModel::with_scripted([MockModel::reply_text("hi")]);
+    let mut agent = Agent::new(model).with_tool(MockTool::echoing("echo"));
+    let mut io = VecIo::with_inputs(Vec::<&str>::new());
+
+    // Complete a plain turn so the transcript ends in a finished assistant reply.
+    agent.step_stream("go", &mut io).await.unwrap();
+    assert!(!agent.has_pending_approvals());
+    let calls_before = agent.model().calls().len();
+
+    let err = agent.resume_with_approvals(&mut io).await.unwrap_err();
+    assert!(matches!(err, sweet_core::Error::Unsupported(_)));
+    assert_eq!(
+        agent.model().calls().len(),
+        calls_before,
+        "resume with nothing pending must not call the model"
+    );
+}
