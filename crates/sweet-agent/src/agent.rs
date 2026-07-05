@@ -641,10 +641,7 @@ impl<M: Model> Agent<M> {
                 Gate::Deny(err) => Err(err),
                 // Non-interruptible turn: nowhere to park a deferral, so it is
                 // treated as a denial (see `ApprovalDecision::Defer`).
-                Gate::Defer => Err(ToolError::PermissionDenied(format!(
-                    "User denied tool call: {}",
-                    call.name
-                ))),
+                Gate::Defer => Err(user_denied(call)),
             };
 
             let handoff = match &result {
@@ -1101,10 +1098,7 @@ impl<M: Model> Agent<M> {
                 self.permission.allow(call.name.clone(), scope);
                 Gate::Proceed
             }
-            Ok(ApprovalDecision::Deny) => Gate::Deny(ToolError::PermissionDenied(format!(
-                "User denied tool call: {}",
-                call.name
-            ))),
+            Ok(ApprovalDecision::Deny) => Gate::Deny(user_denied(call)),
             Ok(ApprovalDecision::Defer) => Gate::Defer,
             Err(e) => Gate::Deny(ToolError::PermissionDenied(format!(
                 "Approval check failed: {e}"
@@ -1207,6 +1201,13 @@ async fn observe_tool_call(
 /// Turn a tool-call result into the display text (for IO + hooks) and the
 /// `Role::Tool` session message. On success the message carries the tool's full
 /// content blocks (text and any images); errors and handoffs become plain text.
+/// The `PermissionDenied` error recorded when a tool call is refused — an
+/// explicit `Deny`, or a `Defer` in a non-interruptible turn where there is
+/// nowhere to park it. Shared so both denial paths report the same message.
+fn user_denied(call: &ToolCall) -> ToolError {
+    ToolError::PermissionDenied(format!("User denied tool call: {}", call.name))
+}
+
 fn tool_result_to_message(
     call_id: &str,
     result: &std::result::Result<ToolOutput, ToolError>,
@@ -1571,6 +1572,65 @@ mod tests {
             recorded,
             vec![HookEvent::BeforeToolCall, HookEvent::AfterToolCall],
             "the deferred call must fire exactly one balanced Before/After pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_lifecycle_hooks_fire_once_across_pause_and_resume() {
+        // A turn that pauses for approval and later resumes is still one logical
+        // turn: `BeforeTurn` fires once at the start (not again on resume) and
+        // `AfterTurn` once at completion (not at the pause). The pause itself
+        // fires neither closing nor a second opening hook.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let model = MockModel::with_scripted([
+            MockModel::reply_tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"msg": "hi"}),
+            }]),
+            MockModel::reply_text("done"),
+        ]);
+        let mut agent = Agent::new(model)
+            .with_tool(MockTool::echoing("echo"))
+            .with_capabilities([
+                Capability::Procedure(ProcedureSpec::new(
+                    "record-turn",
+                    "Record turn-level hook events",
+                    RecordingProcedure {
+                        events: events.clone(),
+                    },
+                )),
+                Capability::hook(HookEvent::BeforeTurn, "record-turn"),
+                Capability::hook(HookEvent::AfterTurn, "record-turn"),
+            ]);
+
+        let mut io = VecIo::with_inputs(Vec::<&str>::new());
+        io.approval_decision = ApprovalDecision::Defer;
+
+        let outcome = agent
+            .step_stream_interruptible("go", &mut io)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, TurnOutcome::Paused { .. }));
+        // Paused: `BeforeTurn` has fired, but the turn is not finished, so no
+        // `AfterTurn` yet.
+        assert_eq!(
+            events.lock().unwrap().clone(),
+            vec![HookEvent::BeforeTurn],
+            "a paused turn fires BeforeTurn but not AfterTurn"
+        );
+
+        io.approval_decision = ApprovalDecision::Allow;
+        let outcome = agent.resume_with_approvals(&mut io).await.unwrap();
+        assert!(matches!(outcome, TurnOutcome::Turn(TurnResult::Message(_))));
+
+        let recorded = events.lock().unwrap().clone();
+        // Resume does not re-open the turn (no second BeforeTurn) and closes it
+        // exactly once.
+        assert_eq!(
+            recorded,
+            vec![HookEvent::BeforeTurn, HookEvent::AfterTurn],
+            "the paused-then-resumed turn fires exactly one BeforeTurn/AfterTurn pair"
         );
     }
 
