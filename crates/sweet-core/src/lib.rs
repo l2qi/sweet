@@ -29,7 +29,8 @@ pub use memory::{
 pub use message::{ContentBlock, FinishReason, Message, Role, ThinkingContent, ToolCall};
 pub use model::Model;
 pub use permission::{
-    approval_scope, ApprovalDecision, ApprovalPreview, PermissionMode, PermissionState, ToolRisk,
+    approval_scope, ApprovalDecision, ApprovalPreview, PendingApproval, PermissionMode,
+    PermissionState, ToolRisk,
 };
 pub use sandbox::{
     CommandOutput, CommandRunner, DirEntry, DirectFs, DirectRunner, DirectSandbox, FileMetadata,

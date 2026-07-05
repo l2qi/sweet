@@ -123,9 +123,13 @@ pub struct VecIo {
     deltas: Vec<String>,
     tool_calls: Vec<ToolCall>,
     tool_results: Vec<(String, String)>,
-    /// Configurable approval decision returned by `on_tool_approval`.
-    /// Defaults to `Allow`.
+    /// Configurable approval decision returned by `on_tool_approval` once the
+    /// `approval_queue` is exhausted. Defaults to `Allow`.
     pub approval_decision: ApprovalDecision,
+    /// Per-call approval decisions, consumed in order before falling back to
+    /// `approval_decision`. Lets a test vary the decision across a batch or a
+    /// resume (e.g. allow the first call, defer the next).
+    pub approval_queue: VecDeque<ApprovalDecision>,
     /// Record of all approval requests received.
     pub approval_requests: Vec<(ToolCall, ToolRisk)>,
 }
@@ -143,6 +147,7 @@ impl VecIo {
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             approval_decision: ApprovalDecision::Allow,
+            approval_queue: VecDeque::new(),
             approval_requests: Vec::new(),
         }
     }
@@ -219,7 +224,10 @@ impl AgentIo for VecIo {
         risk: ToolRisk,
     ) -> Result<ApprovalDecision> {
         self.approval_requests.push((call.clone(), risk));
-        Ok(self.approval_decision)
+        Ok(self
+            .approval_queue
+            .pop_front()
+            .unwrap_or(self.approval_decision))
     }
 }
 

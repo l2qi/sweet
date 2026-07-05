@@ -33,6 +33,28 @@ pub enum TurnResult {
     },
 }
 
+/// Result of an *interruptible* turn ([`crate::Agent::step_stream_interruptible`]
+/// / [`crate::Agent::resume_with_approvals`]): either the turn finished (a
+/// [`TurnResult`]) or it paused awaiting approval of one or more tool calls.
+///
+/// Kept separate from [`TurnResult`] so the plain [`crate::Agent::step`] API and
+/// its many consumers stay unchanged; only callers that opt into the
+/// interruptible API see `Paused`.
+#[derive(Debug, Clone)]
+pub enum TurnOutcome {
+    /// The turn finished normally.
+    Turn(TurnResult),
+    /// The turn paused: these tool calls await an approval decision. Resume with
+    /// [`crate::Agent::resume_with_approvals`] once decisions are available.
+    Paused {
+        /// The calls awaiting an approval decision: the deferred call plus any
+        /// later calls in the same batch that also need approval (read-only or
+        /// unknown followers, which proceed or are rejected on resume without a
+        /// prompt, are not included).
+        pending: Vec<sweet_core::permission::PendingApproval>,
+    },
+}
+
 /// Specification for a handoff tool.
 ///
 /// Build with [`HandoffSpec::new`] and register on an agent via
