@@ -43,10 +43,13 @@ const SYSTEM_READ_PATHS: &[&str] = &[
 /// A filesystem that restricts both read and write operations to a set of
 /// allowed directory roots.
 ///
-/// **Read roots**: system paths + tool paths (from `$PATH`) + the project root.
-/// No access to the user's home directory outside tool paths.
+/// **Read roots**: system paths, tool paths (from `$PATH`), every write root,
+/// and any extra read roots. No access to the user's home directory beyond
+/// those.
 ///
-/// **Write roots**: the project root only (plus `/tmp` via the OS runner).
+/// **Write roots**: the roots passed to [`new`](Self::new) - the project root
+/// plus any extra write roots (e.g. `$CARGO_HOME` for cargo's caches). Writes
+/// outside them are denied; every write root is readable too.
 ///
 /// All roots are canonicalized at construction time. Every read and write call
 /// is validated against the respective root set.

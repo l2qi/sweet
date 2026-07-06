@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use sweet_core::sandbox::{Sandbox, SandboxPolicy};
-use sweet_sandbox::OsSandbox;
+use sweet_sandbox::{OsSandbox, SandboxRoots};
 use tempfile::TempDir;
 
 struct Harness {
@@ -59,8 +59,10 @@ fn try_harness(policy: SandboxPolicy) -> Option<Harness> {
     let sandbox = OsSandbox::new(
         project_root.clone(),
         policy,
-        vec![extra_read_root.clone()],
-        vec![extra_write_root.clone()],
+        SandboxRoots {
+            read: vec![extra_read_root.clone()],
+            write: vec![extra_write_root.clone()],
+        },
         Vec::new(),
     )
     .ok()?;
@@ -218,8 +220,10 @@ async fn runner_reads_symlinked_extra_read_root() {
     let sandbox = match OsSandbox::new(
         project_root.clone(),
         SandboxPolicy::Sandbox,
-        vec![link.clone()],
-        Vec::new(),
+        SandboxRoots {
+            read: vec![link.clone()],
+            write: Vec::new(),
+        },
         Vec::new(),
     ) {
         Ok(s) => s,
@@ -534,6 +538,21 @@ async fn fs_reads_extra_read_root() {
         .await
         .unwrap();
     assert_eq!(bytes, b"EXTRA_READ_MARKER\n");
+}
+
+#[tokio::test]
+async fn fs_reads_extra_write_root() {
+    // Write roots are folded into the read set, so the in-process filesystem
+    // reads back a pre-existing file under an extra write root - completing the
+    // matrix alongside `runner_reads_extra_write_root` and the fs write test.
+    let h = harness_or_skip!(SandboxPolicy::Sandbox);
+    let bytes = h
+        .sandbox
+        .fs()
+        .read(&h.extra_write_root.join("cache.txt"))
+        .await
+        .unwrap();
+    assert_eq!(bytes, b"EXTRA_WRITE_MARKER\n");
 }
 
 #[tokio::test]

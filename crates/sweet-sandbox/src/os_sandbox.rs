@@ -11,6 +11,29 @@ use sweet_core::sandbox::{Filesystem, Sandbox, SandboxError};
 
 use crate::restricted_fs::RestrictedFs;
 
+/// Extra directory roots to expose to the sandbox, beyond the project root
+/// (which is always readable and writable).
+///
+/// The two lists are grouped into a named struct rather than passed as adjacent
+/// `Vec<PathBuf>` arguments precisely because they sit on a security boundary:
+/// transposing a read grant and a write grant would compile silently and
+/// escalate a read-only directory to writable. Naming the fields at the call
+/// site makes that mistake impossible.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxRoots {
+    /// Directories the agent may read but not write - e.g. session state
+    /// outside the project root, or an ancestor `.cargo` dir cargo discovers by
+    /// walking up from the working dir. Honored by both the in-process
+    /// filesystem (file tools) and the OS command runner (sandboxed shell
+    /// commands like `cargo build`), so the agent can read those files back even
+    /// though the home directory is otherwise hidden.
+    pub read: Vec<PathBuf>,
+    /// Directories the agent may write as well as read - e.g. the cargo
+    /// registry/cache under `$CARGO_HOME`, which `cargo build` must populate but
+    /// which lives outside the project root.
+    pub write: Vec<PathBuf>,
+}
+
 /// A local sandbox that enforces OS-level restrictions.
 ///
 /// On macOS: uses Seatbelt (`sandbox-exec`) for command isolation.
@@ -33,27 +56,22 @@ impl OsSandbox {
     /// `project_root` is the only directory where writes are allowed.
     /// `policy` controls sandbox and network restrictions and is fixed for
     /// the lifetime of the sandbox.
-    /// `extra_read_roots` are additional directories the agent may read but not
-    /// write - e.g. session state outside the project root, or an ancestor
-    /// `.cargo` dir cargo discovers by walking up from the working dir. They are
-    /// honored by both the in-process filesystem (file tools) and the OS command
-    /// runner (sandboxed shell commands like `cargo build`), so the agent can
-    /// read those files back even though the home directory is otherwise hidden.
-    /// `extra_write_roots` are additional directories the agent may **write** as
-    /// well as read - e.g. the cargo registry/cache under `$CARGO_HOME`, which
-    /// `cargo build` must populate but which lives outside the project root.
-    /// Both root lists are `Vec<PathBuf>`; keep them in this order - swapping
-    /// them silently grants writes where only reads were intended.
+    /// `extra_roots` are additional read-only and read-write directories to
+    /// expose beyond the project root - see [`SandboxRoots`].
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)
     /// that must never be exposed to the sandbox, on top of the built-in
     /// credential directories. Use it to hide an application's own secrets.
     pub fn new(
         project_root: PathBuf,
         policy: SandboxPolicy,
-        extra_read_roots: Vec<PathBuf>,
-        extra_write_roots: Vec<PathBuf>,
+        extra_roots: SandboxRoots,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
+        let SandboxRoots {
+            read: extra_read_roots,
+            write: extra_write_roots,
+        } = extra_roots;
+
         let canonical_root =
             dunce::canonicalize(&project_root).unwrap_or_else(|_| project_root.clone());
 
