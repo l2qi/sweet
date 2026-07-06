@@ -39,6 +39,11 @@ impl OsSandbox {
     /// honored by both the in-process filesystem (file tools) and the OS command
     /// runner (sandboxed shell commands like `cargo build`), so the agent can
     /// read those files back even though the home directory is otherwise hidden.
+    /// `extra_write_roots` are additional directories the agent may **write** as
+    /// well as read - e.g. the cargo registry/cache under `$CARGO_HOME`, which
+    /// `cargo build` must populate but which lives outside the project root.
+    /// Both root lists are `Vec<PathBuf>`; keep them in this order - swapping
+    /// them silently grants writes where only reads were intended.
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)
     /// that must never be exposed to the sandbox, on top of the built-in
     /// credential directories. Use it to hide an application's own secrets.
@@ -46,25 +51,32 @@ impl OsSandbox {
         project_root: PathBuf,
         policy: SandboxPolicy,
         extra_read_roots: Vec<PathBuf>,
+        extra_write_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
         let canonical_root =
             dunce::canonicalize(&project_root).unwrap_or_else(|_| project_root.clone());
 
-        // Canonicalize the extra read roots once, at the boundary, exactly as we
-        // do for `project_root`. The OS command runners match on the resolved
-        // path (Seatbelt lists both `/tmp` and `/private/tmp` for this reason),
-        // so a symlinked or relative root passed raw would be readable by the
-        // in-process file tools (which canonicalize internally) yet denied to
-        // sandboxed commands. Canonicalizing here keeps both layers in agreement.
+        // Canonicalize the extra read/write roots once, at the boundary, exactly
+        // as we do for `project_root`. The OS command runners match on the
+        // resolved path (Seatbelt lists both `/tmp` and `/private/tmp` for this
+        // reason), so a symlinked or relative root passed raw would be reachable
+        // by the in-process file tools (which canonicalize internally) yet denied
+        // to sandboxed commands. Canonicalizing here keeps both layers in
+        // agreement.
         let extra_read_roots: Vec<PathBuf> = extra_read_roots
             .into_iter()
             .map(|r| dunce::canonicalize(&r).unwrap_or(r))
             .collect();
+        let extra_write_roots: Vec<PathBuf> = extra_write_roots
+            .into_iter()
+            .map(|r| dunce::canonicalize(&r).unwrap_or(r))
+            .collect();
 
-        let fs: Arc<dyn Filesystem> = Arc::new(RestrictedFs::with_local_fs_and_reads(
+        let fs: Arc<dyn Filesystem> = Arc::new(RestrictedFs::with_local_fs_reads_and_writes(
             canonical_root.clone(),
             extra_read_roots.clone(),
+            extra_write_roots.clone(),
             extra_secret_dirs.clone(),
         ));
 
@@ -73,20 +85,27 @@ impl OsSandbox {
             fs,
             policy,
             extra_read_roots,
+            extra_write_roots,
             extra_secret_dirs,
         )
     }
 
+    /// The runner's write roots are the project root plus every extra write
+    /// root; both backends fold write roots into their read rules, so these
+    /// stay readable too.
     #[cfg(target_os = "macos")]
     fn build(
         canonical_root: PathBuf,
         fs: Arc<dyn Filesystem>,
         policy: SandboxPolicy,
         extra_read_roots: Vec<PathBuf>,
+        extra_write_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
+        let mut write_roots = vec![canonical_root];
+        write_roots.extend(extra_write_roots);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::seatbelt::SeatbeltRunner::new(
-            vec![canonical_root],
+            write_roots,
             extra_read_roots,
             policy,
             extra_secret_dirs,
@@ -100,10 +119,13 @@ impl OsSandbox {
         fs: Arc<dyn Filesystem>,
         policy: SandboxPolicy,
         extra_read_roots: Vec<PathBuf>,
+        extra_write_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
+        let mut write_roots = vec![canonical_root];
+        write_roots.extend(extra_write_roots);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::bubblewrap::BubblewrapRunner::new(
-            vec![canonical_root],
+            write_roots,
             extra_read_roots,
             policy,
             extra_secret_dirs,
@@ -117,6 +139,7 @@ impl OsSandbox {
         _fs: Arc<dyn Filesystem>,
         _policy: SandboxPolicy,
         _extra_read_roots: Vec<PathBuf>,
+        _extra_write_roots: Vec<PathBuf>,
         _extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
         Err(SandboxError::Backend(
