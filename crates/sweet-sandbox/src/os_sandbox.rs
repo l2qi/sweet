@@ -30,7 +30,10 @@ pub struct SandboxRoots {
     pub read: Vec<PathBuf>,
     /// Directories the agent may write as well as read - e.g. the cargo
     /// registry/cache under `$CARGO_HOME`, which `cargo build` must populate but
-    /// which lives outside the project root.
+    /// which lives outside the project root. Exactly like the project root, a
+    /// write root is also *executable* (macOS Seatbelt grants it `process-exec`;
+    /// on Linux the bind mount is exec by default), so binaries placed under one
+    /// can run.
     pub write: Vec<PathBuf>,
 }
 

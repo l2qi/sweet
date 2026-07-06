@@ -145,7 +145,11 @@ impl RestrictedFs {
     /// `cargo build` writes there, yet it lives outside the project root.
     /// Write roots are folded into the read set by [`new`](Self::new), so a
     /// write root is always also readable.
-    pub fn with_local_fs_reads_and_writes(
+    ///
+    /// Crate-private: only `OsSandbox` and the `with_local_fs_and_reads`
+    /// delegate need it. External callers that want extra write roots use the
+    /// primitive [`new`](Self::new), which takes the full write-root list.
+    pub(crate) fn with_local_fs_reads_and_writes(
         project_root: PathBuf,
         extra_read_roots: Vec<PathBuf>,
         extra_write_roots: Vec<PathBuf>,
