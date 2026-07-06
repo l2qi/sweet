@@ -56,7 +56,8 @@ pub struct OsSandbox {
 impl OsSandbox {
     /// Create a new OS-enforced sandbox.
     ///
-    /// `project_root` is the only directory where writes are allowed.
+    /// `project_root` is always writable, as is every `extra_roots.write`
+    /// entry (see [`SandboxRoots`]); writes anywhere else are denied.
     /// `policy` controls sandbox and network restrictions and is fixed for
     /// the lifetime of the sandbox.
     /// `extra_roots` are additional read-only and read-write directories to
