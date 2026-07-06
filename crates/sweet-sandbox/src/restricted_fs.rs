@@ -121,7 +121,8 @@ impl RestrictedFs {
     /// `extra_read_roots` (e.g. a directory holding session state outside the
     /// project root, which the agent must be able to read back even though the
     /// rest of the home directory is hidden). Writes stay limited to the
-    /// project root.
+    /// project root - to also grant *write* access beyond it (e.g. `$CARGO_HOME`)
+    /// use [`new`](Self::new) with an explicit write-root list.
     ///
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)
     /// to keep out of the resolved tool roots, on top of the built-in

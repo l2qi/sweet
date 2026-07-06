@@ -101,30 +101,24 @@ impl OsSandbox {
             extra_secret_dirs.clone(),
         ));
 
-        Self::build(
-            canonical_root,
-            fs,
-            policy,
-            extra_read_roots,
-            extra_write_roots,
-            extra_secret_dirs,
-        )
+        // The runner's write roots are the project root plus every extra write
+        // root. Assemble them once here so each platform `build` just forwards
+        // the finished list; both backends fold write roots into their read
+        // rules, so these stay readable too.
+        let mut write_roots = vec![canonical_root];
+        write_roots.extend(extra_write_roots);
+
+        Self::build(fs, policy, extra_read_roots, write_roots, extra_secret_dirs)
     }
 
-    /// The runner's write roots are the project root plus every extra write
-    /// root; both backends fold write roots into their read rules, so these
-    /// stay readable too.
     #[cfg(target_os = "macos")]
     fn build(
-        canonical_root: PathBuf,
         fs: Arc<dyn Filesystem>,
         policy: SandboxPolicy,
         extra_read_roots: Vec<PathBuf>,
-        extra_write_roots: Vec<PathBuf>,
+        write_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
-        let mut write_roots = vec![canonical_root];
-        write_roots.extend(extra_write_roots);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::seatbelt::SeatbeltRunner::new(
             write_roots,
             extra_read_roots,
@@ -136,15 +130,12 @@ impl OsSandbox {
 
     #[cfg(target_os = "linux")]
     fn build(
-        canonical_root: PathBuf,
         fs: Arc<dyn Filesystem>,
         policy: SandboxPolicy,
         extra_read_roots: Vec<PathBuf>,
-        extra_write_roots: Vec<PathBuf>,
+        write_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
-        let mut write_roots = vec![canonical_root];
-        write_roots.extend(extra_write_roots);
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::bubblewrap::BubblewrapRunner::new(
             write_roots,
             extra_read_roots,
@@ -156,11 +147,10 @@ impl OsSandbox {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn build(
-        _canonical_root: PathBuf,
         _fs: Arc<dyn Filesystem>,
         _policy: SandboxPolicy,
         _extra_read_roots: Vec<PathBuf>,
-        _extra_write_roots: Vec<PathBuf>,
+        _write_roots: Vec<PathBuf>,
         _extra_secret_dirs: Vec<String>,
     ) -> Result<Self, SandboxError> {
         Err(SandboxError::Backend(
