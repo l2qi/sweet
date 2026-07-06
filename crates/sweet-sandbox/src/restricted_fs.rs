@@ -122,7 +122,7 @@ impl RestrictedFs {
     /// project root, which the agent must be able to read back even though the
     /// rest of the home directory is hidden). Writes stay limited to the
     /// project root - to also grant *write* access beyond it (e.g. `$CARGO_HOME`)
-    /// use [`new`](Self::new) with an explicit write-root list.
+    /// use [`with_local_fs_and_reads_and_writes`](Self::with_local_fs_and_reads_and_writes).
     ///
     /// `extra_secret_dirs` lists home-relative directories (e.g. `".myapp"`)
     /// to keep out of the resolved tool roots, on top of the built-in
@@ -132,7 +132,7 @@ impl RestrictedFs {
         extra_read_roots: Vec<PathBuf>,
         extra_secret_dirs: Vec<String>,
     ) -> Self {
-        Self::with_local_fs_reads_and_writes(
+        Self::with_local_fs_and_reads_and_writes(
             project_root,
             extra_read_roots,
             Vec::new(),
@@ -147,10 +147,10 @@ impl RestrictedFs {
     /// Write roots are folded into the read set by [`new`](Self::new), so a
     /// write root is always also readable.
     ///
-    /// Crate-private: only `OsSandbox` and the `with_local_fs_and_reads`
-    /// delegate need it. External callers that want extra write roots use the
-    /// primitive [`new`](Self::new), which takes the full write-root list.
-    pub(crate) fn with_local_fs_reads_and_writes(
+    /// Prefer this over the primitive [`new`](Self::new) when you want the same
+    /// readable tool paths (cargo, rustup, `$PATH`) the other convenience
+    /// constructors mount; `new` does not resolve those.
+    pub fn with_local_fs_and_reads_and_writes(
         project_root: PathBuf,
         extra_read_roots: Vec<PathBuf>,
         extra_write_roots: Vec<PathBuf>,

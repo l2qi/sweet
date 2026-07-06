@@ -94,7 +94,7 @@ impl OsSandbox {
             .map(|r| dunce::canonicalize(&r).unwrap_or(r))
             .collect();
 
-        let fs: Arc<dyn Filesystem> = Arc::new(RestrictedFs::with_local_fs_reads_and_writes(
+        let fs: Arc<dyn Filesystem> = Arc::new(RestrictedFs::with_local_fs_and_reads_and_writes(
             canonical_root.clone(),
             extra_read_roots.clone(),
             extra_write_roots.clone(),
